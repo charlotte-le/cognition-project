@@ -1,0 +1,5 @@
+.env
+cognition-project.db
+__pycache__/
+.venv/
+*.pyc
