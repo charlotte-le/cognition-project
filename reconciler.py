@@ -1,0 +1,574 @@
+"""Reconciler module for cognition-project.
+
+This module implements the main orchestration loop that:
+- Runs every TICK_SECONDS
+- Reacts to state, not to events
+- Takes at most one transition per task per tick
+- Survives crashes (nothing important lives in memory)
+"""
+
+import asyncio
+import json
+import logging
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import config
+import db
+from devin import get_client, normalize, Internal
+from github import get_client
+from prompts import render_brief, structured_output_schema
+from verifier import verify, VerifyContext, Verdict
+
+logger = logging.getLogger(__name__)
+
+
+# Global HALT latch
+_halt_latched = False
+
+
+def can_admit(task: Dict[str, Any]) -> Tuple[bool, str]:
+    """Check if a task can be admitted for processing.
+    
+    Admission policy:
+    - The class is in RULE_ALLOWLIST
+    - db.count_active() < cfg.MAX_CONCURRENT
+    - db.acus_today() < cfg.DAILY_ACU_CEILING
+    - No HALT is latched
+    
+    Returns:
+        Tuple of (admitted: bool, reason: str)
+    """
+    # Check HALT latch
+    if _halt_latched:
+        return False, "HALT latched - no new sessions allowed"
+    
+    # Check class allowlist
+    cls = task.get("class", "")
+    if cls not in config.RULE_ALLOWLIST:
+        return False, f"Class {cls} not in allowlist"
+    
+    # Check concurrency
+    active_count = db.count_active()
+    if active_count >= config.MAX_CONCURRENT:
+        return False, f"Concurrency limit reached ({active_count}/{config.MAX_CONCURRENT})"
+    
+    # Check daily ACU ceiling
+    acus_today = db.acus_today()
+    if acus_today >= config.DAILY_ACU_CEILING:
+        return False, f"Daily ACU ceiling reached ({acus_today}/{config.DAILY_ACU_CEILING})"
+    
+    return True, "Admitted"
+
+
+def harvest_pr(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Harvest PR information from a session.
+    
+    Extracts both structured_output (what the agent says happened) and 
+    pull_requests[] (what the API observed).
+    
+    Args:
+        session: Session dictionary from Devin API.
+        
+    Returns:
+        Dictionary with structured_output and pull_requests, or None if no PR.
+    """
+    pull_requests = session.get("pull_requests", [])
+    if not pull_requests:
+        return None
+    
+    # Get the first PR (should only be one)
+    pr = pull_requests[0]
+    
+    return {
+        "structured_output": session.get("structured_output"),
+        "pr_state": pr.get("pr_state"),
+        "pr_url": pr.get("pr_url"),
+    }
+
+
+async def tick() -> None:
+    """Run one tick of the reconciler.
+    
+    Each tick:
+    1. Fetches open issues labeled cognition-project:auto (desired state)
+    2. Fetches all tagged sessions (observed state)
+    3. Joins them to the ledger by fingerprint and reconciles
+    4. Takes at most one transition per task
+    """
+    global _halt_latched
+    
+    github_client = get_client()
+    devin_client = get_client()
+    
+    # Fetch desired state: open issues labeled cognition-project:auto
+    try:
+        open_issues = github_client.list_open_issues(label="cognition-project:auto")
+    except Exception as e:
+        logger.error(f"Failed to fetch open issues: {e}")
+        return
+    
+    # Fetch observed state: all tagged sessions
+    try:
+        tagged_sessions = devin_client.list_tagged_sessions()
+    except Exception as e:
+        logger.error(f"Failed to fetch tagged sessions: {e}")
+        return
+    
+    # Build session lookup by fingerprint
+    # Session title format: [cognition-project] scan:<fp> att=<attempt_no> — <description>
+    session_by_fp: Dict[str, Dict[str, Any]] = {}
+    unrecognized_sessions: List[Dict[str, Any]] = []
+    
+    for session in tagged_sessions:
+        title = session.get("title", "")
+        # Extract fingerprint from title
+        if "[cognition-project]" in title and "scan:" in title:
+            try:
+                # Parse: [cognition-project] scan:a91c3f2e att=1 — B608 sqla/models.py
+                parts = title.split()
+                fp_part = [p for p in parts if p.startswith("scan:")]
+                if fp_part:
+                    fp = fp_part[0]  # e.g., "scan:a91c3f2e"
+                    session_by_fp[fp] = session
+            except Exception as e:
+                logger.warning(f"Failed to parse session title '{title}': {e}")
+                unrecognized_sessions.append(session)
+        else:
+            unrecognized_sessions.append(session)
+    
+    # Log unrecognized sessions (should surface on status page)
+    if unrecognized_sessions:
+        logger.warning(f"Found {len(unrecognized_sessions)} unrecognized tagged sessions")
+        for session in unrecognized_sessions:
+            logger.warning(f"  Unrecognized session: {session.get('title', 'unknown')} (id: {session.get('session_id')})")
+    
+    # Build task lookup by fingerprint
+    tasks = db.list_tasks()
+    task_by_fp: Dict[str, Dict[str, Any]] = {task["fp"]: task for task in tasks}
+    
+    # Join issues to tasks by fingerprint (from issue body footer)
+    issue_by_fp: Dict[str, Dict[str, Any]] = {}
+    for issue in open_issues:
+        body = issue.get("body", "")
+        # Extract fingerprint from footer: <!-- cognition-project:fp=<fp> -->
+        if "<!-- cognition-project:fp=" in body:
+            try:
+                start = body.index("<!-- cognition-project:fp=") + len("<!-- cognition-project:fp=")
+                end = body.index("-->", start)
+                fp = body[start:end].strip()
+                issue_by_fp[fp] = issue
+            except (ValueError, IndexError):
+                logger.warning(f"Failed to parse fingerprint from issue #{issue.get('number')}")
+    
+    # Reconcile each task
+    for fp, task in task_by_fp.items():
+        try:
+            await reconcile_task(fp, task, session_by_fp.get(fp), issue_by_fp.get(fp), github_client, devin_client)
+        except Exception as e:
+            logger.error(f"Error reconciling task {fp}: {e}")
+
+
+async def reconcile_task(
+    fp: str,
+    task: Dict[str, Any],
+    session: Optional[Dict[str, Any]],
+    issue: Optional[Dict[str, Any]],
+    github_client,
+    devin_client
+) -> None:
+    """Reconcile a single task, taking at most one transition.
+    
+    Args:
+        fp: Task fingerprint.
+        task: Task dictionary from the database.
+        session: Session dictionary from Devin API (if exists).
+        issue: Issue dictionary from GitHub API (if exists).
+        github_client: GitHub client instance.
+        devin_client: Devin client instance.
+    """
+    state = task.get("state", db.State.PENDING)
+    attempt_count = task.get("attempt_count", 0)
+    
+    # PENDING -> RUNNING: create session if policy admits
+    if state == db.State.PENDING:
+        admitted, reason = can_admit(task)
+        if admitted:
+            await create_session(fp, task, devin_client)
+        else:
+            logger.info(f"Task {fp} not admitted: {reason}")
+    
+    # RUNNING: normalize and transition based on session state
+    elif state == db.State.RUNNING:
+        if not session:
+            logger.warning(f"Task {fp} is RUNNING but has no session")
+            return
+        
+        normalized = normalize(session.get("status"), session.get("status_detail"))
+        
+        # Check wall clock
+        task_updated = datetime.fromisoformat(task.get("updated_at"))
+        wall_clock_minutes = (datetime.utcnow() - task_updated).total_seconds() / 60
+        if wall_clock_minutes > config.WALL_CLOCK_MINUTES:
+            logger.warning(f"Task {fp} wall clock exceeded ({wall_clock_minutes:.1f}m > {config.WALL_CLOCK_MINUTES}m)")
+            if db.transition(fp, db.State.RUNNING, db.State.FAILED):
+                logger.info(f"Task {fp} -> FAILED (wall clock exceeded)")
+            return
+        
+        # RUNNING -> BLOCKED: agent asked a question
+        if normalized == Internal.BLOCKED:
+            if db.transition(fp, db.State.RUNNING, db.State.BLOCKED):
+                logger.info(f"Task {fp} -> BLOCKED (agent asked question)")
+                # Comment on issue with agent's question and session link
+                if issue:
+                    question = session.get("status_detail", "Agent is waiting for user input")
+                    session_url = session.get("url", "")
+                    comment = f"Agent has a question:\n\n{question}\n\nSession: {session_url}"
+                    github_client.comment(issue.get("number"), comment)
+        
+        # RUNNING -> VERIFYING: session completed, harvest PR
+        elif normalized == Internal.DONE:
+            pr_info = harvest_pr(session)
+            if pr_info:
+                # Update ACUs and transition to VERIFYING
+                acus_consumed = session.get("acus_consumed", 0)
+                new_acus_total = task.get("acus_total", 0) + acus_consumed
+                
+                # Store structured_output in attempts table
+                attempt_id = task.get("current_attempt_id")  # This should be set when session created
+                if attempt_id:
+                    db.finish_attempt(
+                        attempt_id,
+                        session_id=session.get("session_id"),
+                        session_url=session.get("url"),
+                        outcome="completed",
+                        claim_json=pr_info.get("structured_output"),
+                        acus_consumed=acus_consumed,
+                    )
+                
+                if db.transition(fp, db.State.RUNNING, db.State.VERIFYING, acus_total=new_acus_total):
+                    logger.info(f"Task {fp} -> VERIFYING (session completed)")
+            else:
+                logger.warning(f"Task {fp} session completed but no PR found")
+        
+        # RUNNING -> FAILED: session failed
+        elif normalized == Internal.FAILED:
+            if db.transition(fp, db.State.RUNNING, db.State.FAILED):
+                logger.info(f"Task {fp} -> FAILED (session failed)")
+        
+        # RUNNING -> HALT: HALT signal from platform
+        elif normalized == Internal.HALT:
+            global _halt_latched
+            _halt_latched = True
+            logger.error(f"HALT signal received from platform for task {fp}")
+            if db.transition(fp, db.State.RUNNING, db.State.FAILED):
+                logger.info(f"Task {fp} -> FAILED (HALT signal)")
+    
+    # VERIFYING: run the verifier
+    elif state == db.State.VERIFYING:
+        await run_verification(fp, task, session, issue, github_client)
+    
+    # READY: check if PR is merged
+    elif state == db.State.READY:
+        if not session:
+            logger.warning(f"Task {fp} is READY but has no session")
+            return
+        
+        pr_info = harvest_pr(session)
+        if pr_info and pr_info.get("pr_state") == "merged":
+            if db.transition(fp, db.State.READY, db.State.MERGED):
+                logger.info(f"Task {fp} -> MERGED")
+                if issue:
+                    github_client.close_issue(issue.get("number"))
+    
+    # BLOCKED: can be resumed if session becomes RUNNING again
+    elif state == db.State.BLOCKED:
+        if session:
+            normalized = normalize(session.get("status"), session.get("status_detail"))
+            if normalized == Internal.RUNNING:
+                if db.transition(fp, db.State.BLOCKED, db.State.RUNNING):
+                    logger.info(f"Task {fp} -> RUNNING (resumed)")
+
+
+async def create_session(fp: str, task: Dict[str, Any], devin_client) -> None:
+    """Create a Devin session for a task.
+    
+    Args:
+        fp: Task fingerprint.
+        task: Task dictionary from the database.
+        devin_client: Devin client instance.
+    """
+    attempt_no = task.get("attempt_count", 0) + 1
+    issue_number = task.get("issue_number")
+    
+    # Generate request ID for idempotency
+    request_id = str(uuid.uuid4())
+    
+    # Write attempt row BEFORE create call (idempotency)
+    attempt_id = db.start_attempt(fp, attempt_no, request_id)
+    
+    # Update task with current attempt ID
+    db.transition(fp, db.State.PENDING, db.State.PENDING, current_attempt_id=attempt_id)
+    
+    # Render brief
+    brief = render_brief(task, attempt_no)
+    
+    # Build session title
+    payload = task.get("payload_json", {})
+    if isinstance(payload, str):
+        import json
+        payload = json.loads(payload)
+    
+    rule_id = payload.get("test_id", "unknown")
+    file_path = payload.get("file_path", "unknown")
+    file_name = Path(file_path).name
+    title = f"[cognition-project] {fp} att={attempt_no} — {rule_id} {file_name}"
+    
+    # Create session
+    try:
+        response = devin_client.create_session(
+            prompt=brief,
+            title=title,
+            schema=structured_output_schema()
+        )
+        
+        # Update attempt with session info
+        db.finish_attempt(
+            attempt_id,
+            session_id=response.get("session_id"),
+            session_url=response.get("url"),
+        )
+        
+        # Transition to RUNNING
+        if db.transition(fp, db.State.PENDING, db.State.RUNNING, attempt_count=attempt_no):
+            logger.info(f"Task {fp} -> RUNNING (session created: {response.get('session_id')})")
+    
+    except Exception as e:
+        logger.error(f"Failed to create session for task {fp}: {e}")
+        # Mark attempt as failed
+        db.finish_attempt(attempt_id, outcome="failed")
+
+
+async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict[str, Any]], issue: Optional[Dict[str, Any]], github_client) -> None:
+    """Run verification for a task.
+    
+    Args:
+        fp: Task fingerprint.
+        task: Task dictionary from the database.
+        session: Session dictionary from Devin API.
+        issue: Issue dictionary from GitHub API.
+        github_client: GitHub client instance.
+    """
+    if not session:
+        logger.warning(f"Task {fp} is VERIFYING but has no session")
+        return
+    
+    pr_info = harvest_pr(session)
+    if not pr_info:
+        logger.warning(f"Task {fp} is VERIFYING but has no PR")
+        return
+    
+    # Get PR details
+    pr_url = pr_info.get("pr_url")
+    if not pr_url:
+        logger.warning(f"Task {fp} has no PR URL")
+        return
+    
+    # Extract PR number from URL
+    try:
+        pr_number = int(pr_url.split("/")[-1])
+    except (ValueError, IndexError):
+        logger.error(f"Failed to parse PR number from URL: {pr_url}")
+        return
+    
+    # Get PR details from GitHub
+    try:
+        pr = github_client.find_pr_for_branch(f"cognition-project/{fp}")
+        if not pr:
+            logger.warning(f"PR not found for task {fp}")
+            return
+    except Exception as e:
+        logger.error(f"Failed to fetch PR for task {fp}: {e}")
+        return
+    
+    # Get diff and changed files
+    try:
+        diff = github_client.get_pr_diff(pr_number)
+        changed_files = github_client.get_pr_files(pr_number)
+    except Exception as e:
+        logger.error(f"Failed to fetch PR diff for task {fp}: {e}")
+        return
+    
+    # Build verification context
+    payload = task.get("payload_json", {})
+    if isinstance(payload, str):
+        import json
+        payload = json.loads(payload)
+    
+    ctx = VerifyContext(
+        fp=fp,
+        rule_id=payload.get("test_id", "unknown"),
+        issue_number=task.get("issue_number"),
+        branch=f"cognition-project/{fp}",
+        pr_number=pr_number,
+        pr_head_sha=pr.get("head_sha", ""),
+        pr_body=pr.get("body", ""),
+        changed_files=changed_files,
+        diff=diff,
+        repo_path=Path("."),  # Assumes running in repo root
+    )
+    
+    # Run verifier
+    try:
+        verdict = verify(ctx)
+    except Exception as e:
+        logger.error(f"Verification failed for task {fp}: {e}")
+        return
+    
+    # Update attempt with verdict
+    attempt_id = task.get("current_attempt_id")
+    if attempt_id:
+        db.finish_attempt(
+            attempt_id,
+            verdict_passed=1 if verdict.passed else 0,
+            gate_failed=verdict.gate,
+            evidence_json=verdict.evidence,
+        )
+    
+    # Handle verdict
+    if verdict.passed:
+        # Pass: label and post evidence
+        if db.transition(fp, db.State.VERIFYING, db.State.READY):
+            logger.info(f"Task {fp} -> READY (verification passed)")
+            
+            if issue:
+                # Add labels
+                github_client.add_labels(issue.get("number"), ["cognition-project:verified", "ready-for-review"])
+                
+                # Post evidence comment
+                evidence_comment = f"""## Verification passed
+
+**Verdict:** {verdict.reason}
+
+**Evidence:**
+- Diff stats: {verdict.evidence.get('diff_added_lines', 0)}+ {verdict.evidence.get('diff_removed_lines', 0)}-
+- Session: {session.get('url')}
+- ACUs consumed: {session.get('acus_consumed', 0)}
+
+**Gates passed:** {', '.join(verdict.evidence.get('gates_passed', []))}
+"""
+                github_client.comment(issue.get("number"), evidence_comment)
+    else:
+        # Fail: retry or quarantine
+        attempt_count = task.get("attempt_count", 0)
+        
+        if attempt_count < config.MAX_ATTEMPTS and verdict.counts_as_attempt:
+            # Retry: message the same session
+            logger.info(f"Task {fp} retrying (attempt {attempt_count + 1}/{config.MAX_ATTEMPTS})")
+            
+            if db.transition(fp, db.State.VERIFYING, db.State.RUNNING):
+                db.increment_attempt_count(fp)
+                
+                # Send message to session with verbatim rejection
+                devin_client.send_message(
+                    session.get("session_id"),
+                    f"Verification failed:\n\n{verdict.reason}"
+                )
+        else:
+            # Quarantine
+            logger.warning(f"Task {fp} -> QUARANTINED (max attempts reached)")
+            
+            if db.transition(fp, db.State.VERIFYING, db.State.QUARANTINED):
+                if issue:
+                    # Label needs-human
+                    github_client.add_labels(issue.get("number"), ["needs-human"])
+                    
+                    # Post quarantine comment with diffs and rejections
+                    quarantine_comment = f"""## Task quarantined
+
+This task has reached the maximum number of attempts ({config.MAX_ATTEMPTS}) without passing verification.
+
+**Final rejection:** {verdict.reason}
+
+**Gates failed:** {verdict.gate or 'unknown'}
+
+The branch and PR are left open for forensic analysis.
+"""
+                    github_client.comment(issue.get("number"), quarantine_comment)
+
+
+async def run_loop() -> None:
+    """Run the main reconciler loop."""
+    logger.info("Starting reconciler loop")
+    
+    while True:
+        try:
+            await tick()
+        except Exception as e:
+            logger.error(f"Error in tick: {e}")
+        
+        # Wait for next tick
+        await asyncio.sleep(config.TICK_SECONDS)
+
+
+async def run_once(dry_run: bool = False) -> None:
+    """Run a single tick for testing.
+    
+    Args:
+        dry_run: If True, stub all network calls and print transitions.
+    """
+    if dry_run:
+        logger.info("Running single tick in DRY_RUN mode")
+        
+        # Get all tasks from database
+        tasks = db.list_tasks()
+        
+        logger.info(f"Tasks in database: {len(tasks)}")
+        for task in tasks:
+            fp = task["fp"]
+            state = task["state"]
+            logger.info(f"  Task {fp}: {state}")
+            
+            # Print what transition would be taken
+            if state == db.State.PENDING:
+                admitted, reason = can_admit(task)
+                if admitted:
+                    logger.info(f"    Would transition: PENDING -> RUNNING (create session)")
+                else:
+                    logger.info(f"    Would not admit: {reason}")
+            elif state == db.State.RUNNING:
+                logger.info(f"    Would check session status and normalize")
+            elif state == db.State.VERIFYING:
+                logger.info(f"    Would run verification gates")
+            elif state == db.State.READY:
+                logger.info(f"    Would check if PR is merged")
+            else:
+                logger.info(f"    No transition for state {state}")
+    else:
+        await tick()
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    parser = argparse.ArgumentParser(description="Cognition-project reconciler")
+    parser.add_argument("--once", action="store_true", help="Run a single tick instead of loop")
+    parser.add_argument("--dry-run", action="store_true", help="Stub all network calls")
+    
+    args = parser.parse_args()
+    
+    # Initialize database
+    db.init_db()
+    
+    if args.once:
+        asyncio.run(run_once(dry_run=args.dry_run))
+    else:
+        asyncio.run(run_loop())

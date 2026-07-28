@@ -3,3 +3,8 @@ cognition-project.db
 __pycache__/
 .venv/
 *.pyc
+data/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

@@ -1,0 +1,14 @@
+services:
+  cognition-project:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.example
+      - .env  # Optional - override defaults with real credentials
+    volumes:
+      - cognition-data:/data
+    restart: unless-stopped
+
+volumes:
+  cognition-data:
