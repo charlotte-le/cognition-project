@@ -65,6 +65,8 @@ async def main():
             seed_demo.seed_demo()
     else:
         logger.info("Running in LIVE mode")
+        # In live mode, start with clean database - no demo data
+        logger.info("Live mode - starting with clean database")
     
     # Start reconciler loop and web server concurrently
     logger.info("Starting services")

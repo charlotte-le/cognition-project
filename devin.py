@@ -176,6 +176,35 @@ class DevinClient:
         
         return tagged_sessions
     
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific session by ID.
+        
+        Returns session dict with: session_id, status, status_detail, acus_consumed,
+        pull_requests[{pr_url, pr_state}], structured_output, title, url.
+        Returns None if session not found.
+        """
+        try:
+            response = self._request(
+                "GET",
+                f"/v3/organizations/{self.org_id}/sessions/{session_id}"
+            )
+            
+            # Return the fields we care about
+            return {
+                "session_id": response.get("session_id"),
+                "status": response.get("status"),
+                "status_detail": response.get("status_detail"),
+                "acus_consumed": response.get("acus_consumed"),
+                "pull_requests": response.get("pull_requests", []),
+                "structured_output": response.get("structured_output"),
+                "title": response.get("title"),
+                "url": response.get("url"),
+            }
+        except Exception as e:
+            logger.warning(f"Failed to get session {session_id}: {e}")
+            return None
+    
     def send_message(self, session_id: str, message: str) -> None:
         """
         Send a message to a session.

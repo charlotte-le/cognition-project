@@ -34,7 +34,9 @@ RULE_ALLOWLIST = [
 ]
 
 # Database path (use /data in Docker, local data directory otherwise)
-if os.path.exists("/data"):
+if os.environ.get("DB_PATH"):
+    DB_PATH = os.environ["DB_PATH"]
+elif os.path.exists("/data"):
     DB_PATH = "/data/cognition.db"
 else:
     DB_PATH = os.path.join(os.path.dirname(__file__), "data", "cognition.db")

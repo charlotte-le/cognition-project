@@ -102,7 +102,10 @@ def transition(fp: str, from_state: str, to_state: str, **fields: Any) -> bool:
     
     for key, value in fields.items():
         set_clauses.append(f"{key} = ?")
-        values.append(value)
+        if isinstance(value, (dict, list)):
+            values.append(json.dumps(value))
+        else:
+            values.append(value)
     
     values.extend([fp, from_state])
     
@@ -152,6 +155,21 @@ def list_tasks(states: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         else:
             cursor = conn.execute("SELECT * FROM tasks")
         return [dict(row) for row in cursor.fetchall()]
+
+
+def get_current_attempt(fp: str) -> Optional[Dict[str, Any]]:
+    """Get the current attempt for a task (based on current_attempt_id)."""
+    db_path = _get_db_path()
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("""
+            SELECT * FROM attempts 
+            WHERE fp = ? AND id = (SELECT current_attempt_id FROM tasks WHERE fp = ?)
+        """, (fp, fp))
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        return None
 
 
 def count_active() -> int:
@@ -208,13 +226,13 @@ def finish_attempt(attempt_id: int, **fields: Any) -> None:
 
 
 def acus_today() -> float:
-    """Sum of acus_total for tasks updated today."""
+    """Sum of acus_consumed for attempts that ended today (accurate budget attribution)."""
     db_path = _get_db_path()
     today = datetime.utcnow().date().isoformat()
     
     with sqlite3.connect(db_path) as conn:
         cursor = conn.execute(
-            "SELECT SUM(acus_total) FROM tasks WHERE date(updated_at) = ?",
+            "SELECT SUM(acus_consumed) FROM attempts WHERE date(ended_at) = ?",
             (today,)
         )
         result = cursor.fetchone()[0]

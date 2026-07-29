@@ -1,18 +1,20 @@
 """Web interface for cognition-project.
 
-FastAPI with three routes:
+FastAPI with four routes:
 - POST /webhook — dumb webhook that triggers immediate reconciler tick
 - GET /status — server-rendered HTML status page, no JavaScript
 - POST /scan — manual scan trigger for demo purposes
+- GET /metrics.json — programmatic access to metrics (parseable JSON)
 """
 
 import sqlite3
 import os
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 import config
 import db
@@ -86,32 +88,116 @@ async def status() -> str:
         """)
         tasks = [dict(row) for row in cursor.fetchall()]
         
-        # Get today's ACU usage
+        # Get today's ACU usage - use attempts.ended_at for accurate attribution
         cursor = conn.execute("""
-            SELECT SUM(acus_total) as total
-            FROM tasks
-            WHERE date(updated_at) = date('now')
+            SELECT SUM(acus_consumed) as total
+            FROM attempts
+            WHERE date(ended_at) = date('now')
         """)
         acu_result = cursor.fetchone()
         acus_today = acu_result["total"] if acu_result and acu_result["total"] else 0.0
+        
+        # TRUST: agent claims vs verifier confirmations
+        cursor = conn.execute("""
+            SELECT 
+                COUNT(CASE WHEN verdict_passed = 1 THEN 1 END) as confirmed,
+                COUNT(CASE WHEN verdict_passed = 0 THEN 1 END) as caught,
+                COUNT(*) as total_claims
+            FROM attempts
+            WHERE verdict_passed IS NOT NULL
+        """)
+        trust_result = cursor.fetchone()
+        agent_claims = trust_result["total_claims"] if trust_result and trust_result["total_claims"] else 0
+        verifier_confirmed = trust_result["confirmed"] if trust_result and trust_result["confirmed"] else 0
+        verifier_caught = trust_result["caught"] if trust_result and trust_result["caught"] else 0
+        
+        # COST: ROI calculation
+        cursor = conn.execute("""
+            SELECT 
+                SUM(a.acus_consumed) as total_acus
+            FROM attempts a
+            WHERE a.ended_at IS NOT NULL
+        """)
+        cost_result = cursor.fetchone()
+        total_acus_all = cost_result["total_acus"] if cost_result and cost_result["total_acus"] else 0.0
+        
+        # Count merged PRs separately
+        cursor = conn.execute("""
+            SELECT COUNT(*) as merged_prs
+            FROM tasks
+            WHERE state = 'MERGED'
+        """)
+        merged_result = cursor.fetchone()
+        merged_prs = merged_result["merged_prs"] if merged_result and merged_result["merged_prs"] else 0
+        
+        # GATES: rejections by gate
+        cursor = conn.execute("""
+            SELECT gate_failed, COUNT(*) as count
+            FROM attempts
+            WHERE gate_failed IS NOT NULL AND gate_failed != ''
+            GROUP BY gate_failed
+        """)
+        gate_results = cursor.fetchall()
+        gate_failures = {row["gate_failed"]: row["count"] for row in gate_results}
+        
+        # Median cycle time (find→verified)
+        cursor = conn.execute("""
+            SELECT 
+                AVG((julianday(a.ended_at) - julianday(t.created_at)) * 24 * 60) as avg_minutes
+            FROM attempts a
+            JOIN tasks t ON a.fp = t.fp
+            WHERE a.verdict_passed = 1 AND a.ended_at IS NOT NULL
+        """)
+        cycle_time_result = cursor.fetchone()
+        avg_cycle_time = cycle_time_result["avg_minutes"] if cycle_time_result and cycle_time_result["avg_minutes"] else None
     
     # Build counts
     total_findings = state_counts.get("PENDING", 0) + state_counts.get("RUNNING", 0) + \
                      state_counts.get("VERIFYING", 0) + state_counts.get("READY", 0) + \
                      state_counts.get("MERGED", 0) + state_counts.get("QUARANTINED", 0) + \
-                     state_counts.get("FAILED", 0)
+                     state_counts.get("FAILED", 0) + state_counts.get("BLOCKED", 0)
     
-    verified = state_counts.get("READY", 0) + state_counts.get("MERGED", 0)
+    pending = state_counts.get("PENDING", 0)
     running = state_counts.get("RUNNING", 0) + state_counts.get("VERIFYING", 0)
-    needs_human = state_counts.get("BLOCKED", 0) + state_counts.get("QUARANTINED", 0)
+    verified = state_counts.get("READY", 0)
+    merged = state_counts.get("MERGED", 0)
     quarantined = state_counts.get("QUARANTINED", 0)
+    needs_human = state_counts.get("BLOCKED", 0)
+    failed = state_counts.get("FAILED", 0)
     
-    # Check HALT latch (import reconciler module to access the global)
+    # Check HALT latch and liveness (import reconciler module to access the globals)
     halt_banner = ""
+    last_tick_str = "never"
+    exception_banner = ""
     try:
         import reconciler
         if reconciler._halt_latched:
             halt_banner = '<div style="background-color: #ffcccc; padding: 10px; margin-bottom: 10px; border: 1px solid #ff0000;"><strong>HALT LATCHED — no new sessions allowed</strong></div>'
+        
+        # Get last tick time
+        last_tick_time = reconciler.get_last_tick_time()
+        if last_tick_time:
+            now = datetime.now(timezone.utc)
+            # Ensure both datetimes are timezone-aware
+            if last_tick_time.tzinfo is None:
+                last_tick_time = last_tick_time.replace(tzinfo=timezone.utc)
+            seconds_ago = (now - last_tick_time).total_seconds()
+            if seconds_ago < 60:
+                last_tick_str = f"{int(seconds_ago)}s ago"
+            else:
+                minutes_ago = int(seconds_ago / 60)
+                last_tick_str = f"{minutes_ago}m ago"
+        
+        # Get last tick exception
+        last_exception = reconciler.get_last_tick_exception()
+        if last_exception:
+            exception_banner = f'<div style="background-color: #ffcccc; padding: 10px; margin-bottom: 10px; border: 1px solid #ff0000;"><strong>Last tick error:</strong> {last_exception}</div>'
+        
+        # Get orphaned session count
+        orphaned_count = reconciler.get_orphaned_session_count()
+        if orphaned_count > 0:
+            orphaned_banner = f'<div style="background-color: #fff3cd; padding: 10px; margin-bottom: 10px; border: 1px solid #ff6600;"><strong>{orphaned_count} orphaned session(s) detected</strong></div>'
+            exception_banner = exception_banner + orphaned_banner if exception_banner else orphaned_banner
     except ImportError:
         pass  # reconciler module not available in demo mode
     
@@ -125,6 +211,10 @@ async def status() -> str:
             h1 {{ margin-bottom: 10px; }}
             .header {{ border-bottom: 1px solid #ccc; padding-bottom: 10px; margin-bottom: 20px; }}
             .counts {{ margin-bottom: 20px; }}
+            .metrics {{ margin-bottom: 20px; padding: 15px; background-color: #f9f9f9; border: 1px solid #e0e0e0; }}
+            .metric-row {{ margin-bottom: 8px; }}
+            .metric-row:last-child {{ margin-bottom: 0; }}
+            .metric-label {{ font-weight: bold; display: inline-block; width: 80px; }}
             table {{ border-collapse: collapse; width: 100%; }}
             th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
             th {{ background-color: #f2f2f2; }}
@@ -142,13 +232,25 @@ async def status() -> str:
     <body>
         <h1>COGNITION-PROJECT</h1>
         <div class="header">
-            today: {acus_today:.1f} / {config.DAILY_ACU_CEILING} ACU
+            today: {acus_today:.1f} / {config.DAILY_ACU_CEILING} ACU · last tick {last_tick_str}
         </div>
         
         {halt_banner}
+        {exception_banner}
         
-        <div class="counts">
-            {total_findings} findings   {verified} verified   {running} running   {needs_human} needs-human   {quarantined} quarantined
+        <div class="metrics">
+            <div class="metric-row">
+                <span class="metric-label">TRUST</span>
+                <span>agent claimed fixed {agent_claims}× → verifier confirmed {verifier_confirmed}, caught {verifier_caught}</span>
+            </div>
+            <div class="metric-row">
+                <span class="metric-label">COST</span>
+                <span>{total_acus_all:.1f} ACU → {merged_prs} merged PRs{f' · avg find→verified {avg_cycle_time:.0f}m' if avg_cycle_time else ''}</span>
+            </div>
+            <div class="metric-row">
+                <span class="metric-label">GATES</span>
+                <span>rejections by gate: {f' · '.join([f'{gate} {count}' for gate, count in gate_failures.items()]) if gate_failures else 'none'}</span>
+            </div>
         </div>
         
         <table>
@@ -158,6 +260,8 @@ async def status() -> str:
                     <th>state</th>
                     <th>att</th>
                     <th>ACU</th>
+                    <th>age</th>
+                    <th>anomaly</th>
                     <th>claim → verdict</th>
                     <th>links</th>
                 </tr>
@@ -172,8 +276,33 @@ async def status() -> str:
         attempt_count = task["attempt_count"]
         acus = task["acus_total"]
         
+        # Calculate age
+        created_at = task.get("created_at")
+        age_str = "—"
+        if created_at:
+            try:
+                created = datetime.fromisoformat(created_at)
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                age_seconds = (now - created).total_seconds()
+                if age_seconds < 3600:
+                    age_str = f"{int(age_seconds / 60)}m"
+                elif age_seconds < 86400:
+                    age_str = f"{int(age_seconds / 3600)}h"
+                else:
+                    age_str = f"{int(age_seconds / 86400)}d"
+            except (ValueError, TypeError):
+                age_str = "—"
+        
         # Build claim → verdict column
         claim_verdict = build_claim_verdict(task)
+        
+        # Detect anomalies
+        anomaly_str = ""
+        if state == "RUNNING" and not task.get("session_id"):
+            anomaly_str = "stalled"
+        # Note: orphaned sessions are detected at the reconciler level, not per-task
         
         # Build links
         issue_number = task.get("issue_number")
@@ -193,6 +322,8 @@ async def status() -> str:
                     <td>{state}</td>
                     <td>{attempt_count}</td>
                     <td>{acus:.1f}</td>
+                    <td>{age_str}</td>
+                    <td>{anomaly_str}</td>
                     <td class="claim-verdict">{claim_verdict}</td>
                     <td>{links_str}</td>
                 </tr>
@@ -239,8 +370,6 @@ def build_claim_verdict(task: dict) -> str:
     
     parts = []
     for attempt in attempts:
-        import json
-        
         # Parse claim
         claim_json = attempt.get("claim_json")
         if claim_json:
@@ -266,10 +395,13 @@ def build_claim_verdict(task: dict) -> str:
         
         if verdict_passed == 1:
             verdict = "PASS"
-        elif gate_failed:
-            verdict = f"REJECT ({gate_failed})"
-        else:
-            verdict = "REJECT"
+        elif verdict_passed == 0:
+            if gate_failed:
+                verdict = f"REJECT ({gate_failed})"
+            else:
+                verdict = "REJECT"
+        else:  # verdict_passed is None
+            verdict = "pending"
         
         parts.append(f"{claim_text} → {verdict}")
     
@@ -292,6 +424,159 @@ async def trigger_scan() -> Response:
         return Response(content=f"Scan complete. {len(findings)} findings synced.", status_code=200)
     except Exception as e:
         return Response(content=f"Scan failed: {str(e)}", status_code=500)
+
+
+@app.get("/metrics.json")
+async def metrics_json() -> JSONResponse:
+    """Return metrics as JSON for programmatic access.
+    
+    Same data as the status page metrics, but parseable.
+    """
+    db_path = config.DB_PATH
+    
+    # Check if database exists
+    if not os.path.exists(db_path):
+        return JSONResponse(content={"error": "No database found"}, status_code=404)
+    
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        
+        # Count by state
+        cursor = conn.execute("""
+            SELECT state, COUNT(*) as count
+            FROM tasks
+            GROUP BY state
+        """)
+        state_counts = {row["state"]: row["count"] for row in cursor.fetchall()}
+        
+        # TRUST: agent claims vs verifier confirmations
+        cursor = conn.execute("""
+            SELECT 
+                COUNT(CASE WHEN verdict_passed = 1 THEN 1 END) as confirmed,
+                COUNT(CASE WHEN verdict_passed = 0 THEN 1 END) as caught,
+                COUNT(*) as total_claims
+            FROM attempts
+            WHERE verdict_passed IS NOT NULL
+        """)
+        trust_result = cursor.fetchone()
+        agent_claims = trust_result["total_claims"] if trust_result else 0
+        verifier_confirmed = trust_result["confirmed"] if trust_result else 0
+        verifier_caught = trust_result["caught"] if trust_result else 0
+        
+        # COST: ROI calculation
+        cursor = conn.execute("""
+            SELECT 
+                SUM(a.acus_consumed) as total_acus
+            FROM attempts a
+            WHERE a.ended_at IS NOT NULL
+        """)
+        cost_result = cursor.fetchone()
+        total_acus_all = cost_result["total_acus"] if cost_result and cost_result["total_acus"] else 0.0
+        
+        # Count merged PRs separately
+        cursor = conn.execute("""
+            SELECT COUNT(*) as merged_prs
+            FROM tasks
+            WHERE state = 'MERGED'
+        """)
+        merged_result = cursor.fetchone()
+        merged_prs = merged_result["merged_prs"] if merged_result and merged_result["merged_prs"] else 0
+        
+        # GATES: rejections by gate
+        cursor = conn.execute("""
+            SELECT gate_failed, COUNT(*) as count
+            FROM attempts
+            WHERE gate_failed IS NOT NULL AND gate_failed != ''
+            GROUP BY gate_failed
+        """)
+        gate_results = cursor.fetchall()
+        gate_failures = {row["gate_failed"]: row["count"] for row in gate_results}
+        
+        # Avg cycle time
+        cursor = conn.execute("""
+            SELECT 
+                AVG((julianday(a.ended_at) - julianday(t.created_at)) * 24 * 60) as avg_minutes
+            FROM attempts a
+            JOIN tasks t ON a.fp = t.fp
+            WHERE a.verdict_passed = 1 AND a.ended_at IS NOT NULL
+        """)
+        cycle_time_result = cursor.fetchone()
+        avg_cycle_time = cycle_time_result["avg_minutes"] if cycle_time_result and cycle_time_result["avg_minutes"] else None
+        
+        # Today's ACU usage
+        cursor = conn.execute("""
+            SELECT SUM(acus_consumed) as total
+            FROM attempts
+            WHERE date(ended_at) = date('now')
+        """)
+        acu_result = cursor.fetchone()
+        acus_today = acu_result["total"] if acu_result and acu_result["total"] else 0.0
+        
+        # Build state counts
+        pending = state_counts.get("PENDING", 0)
+        running = state_counts.get("RUNNING", 0) + state_counts.get("VERIFYING", 0)
+        verified = state_counts.get("READY", 0)
+        merged = state_counts.get("MERGED", 0)
+        quarantined = state_counts.get("QUARANTINED", 0)
+        needs_human = state_counts.get("BLOCKED", 0)
+        failed = state_counts.get("FAILED", 0)
+        total_findings = pending + running + verified + merged + quarantined + needs_human + failed
+        
+        # Liveness info
+        last_tick_time = None
+        last_tick_exception = None
+        orphaned_count = 0
+        try:
+            import reconciler
+            last_tick_time = reconciler.get_last_tick_time()
+            last_tick_exception = reconciler.get_last_tick_exception()
+            orphaned_count = reconciler.get_orphaned_session_count()
+        except ImportError:
+            pass
+        
+        # Format last tick time
+        last_tick_str = None
+        if last_tick_time:
+            now = datetime.now(timezone.utc)
+            seconds_ago = (now - last_tick_time).total_seconds()
+            if seconds_ago < 60:
+                last_tick_str = f"{int(seconds_ago)}s ago"
+            else:
+                minutes_ago = int(seconds_ago / 60)
+                last_tick_str = f"{minutes_ago}m ago"
+        
+        return JSONResponse(content={
+            "trust": {
+                "agent_claims": agent_claims,
+                "verifier_confirmed": verifier_confirmed,
+                "verifier_caught": verifier_caught
+            },
+            "flow": {
+                "total_findings": total_findings,
+                "pending": pending,
+                "running": running,
+                "verified": verified,
+                "merged": merged,
+                "quarantined": quarantined,
+                "needs_human": needs_human,
+                "failed": failed
+            },
+            "cost": {
+                "total_acus": total_acus_all,
+                "merged_prs": merged_prs,
+                "avg_cycle_time_minutes": avg_cycle_time
+            },
+            "gates": gate_failures,
+            "liveness": {
+                "last_tick": last_tick_str,
+                "last_tick_exception": last_tick_exception,
+                "orphaned_sessions": orphaned_count
+            },
+            "budget": {
+                "acus_today": acus_today,
+                "daily_acu_ceiling": config.DAILY_ACU_CEILING
+            }
+        })
 
 
 def should_tick_immediately() -> bool:

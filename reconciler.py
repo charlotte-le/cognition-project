@@ -17,8 +17,8 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import config
 import db
-from devin import get_client, normalize, Internal
-from github import get_client
+from devin import get_client as get_devin_client, normalize, Internal
+from github import get_client as get_github_client
 from prompts import render_brief, structured_output_schema
 from verifier import verify, VerifyContext, Verdict
 
@@ -27,6 +27,26 @@ logger = logging.getLogger(__name__)
 
 # Global HALT latch
 _halt_latched = False
+
+# Global liveness tracking
+_last_tick_time = None
+_last_tick_exception = None
+_orphaned_session_count = 0
+
+
+def get_last_tick_time():
+    """Get the last tick time for liveness monitoring."""
+    return _last_tick_time
+
+
+def get_last_tick_exception():
+    """Get the last tick exception for liveness monitoring."""
+    return _last_tick_exception
+
+
+def get_orphaned_session_count():
+    """Get the count of orphaned sessions for anomaly monitoring."""
+    return _orphaned_session_count
 
 
 def can_admit(task: Dict[str, Any]) -> Tuple[bool, str]:
@@ -98,16 +118,21 @@ async def tick() -> None:
     3. Joins them to the ledger by fingerprint and reconciles
     4. Takes at most one transition per task
     """
-    global _halt_latched
+    global _halt_latched, _last_tick_time, _last_tick_exception, _orphaned_session_count
     
-    github_client = get_client()
-    devin_client = get_client()
+    _last_tick_time = datetime.utcnow()
+    _last_tick_exception = None
+    _orphaned_session_count = 0
+    
+    github_client = get_github_client()
+    devin_client = get_devin_client()
     
     # Fetch desired state: open issues labeled cognition-project:auto
     try:
         open_issues = github_client.list_open_issues(label="cognition-project:auto")
     except Exception as e:
         logger.error(f"Failed to fetch open issues: {e}")
+        _last_tick_exception = str(e)
         return
     
     # Fetch observed state: all tagged sessions
@@ -115,6 +140,7 @@ async def tick() -> None:
         tagged_sessions = devin_client.list_tagged_sessions()
     except Exception as e:
         logger.error(f"Failed to fetch tagged sessions: {e}")
+        _last_tick_exception = str(e)
         return
     
     # Build session lookup by fingerprint
@@ -141,6 +167,7 @@ async def tick() -> None:
     
     # Log unrecognized sessions (should surface on status page)
     if unrecognized_sessions:
+        _orphaned_session_count = len(unrecognized_sessions)
         logger.warning(f"Found {len(unrecognized_sessions)} unrecognized tagged sessions")
         for session in unrecognized_sessions:
             logger.warning(f"  Unrecognized session: {session.get('title', 'unknown')} (id: {session.get('session_id')})")
@@ -169,6 +196,7 @@ async def tick() -> None:
             await reconcile_task(fp, task, session_by_fp.get(fp), issue_by_fp.get(fp), github_client, devin_client)
         except Exception as e:
             logger.error(f"Error reconciling task {fp}: {e}")
+            _last_tick_exception = str(e)
 
 
 async def reconcile_task(
@@ -203,8 +231,18 @@ async def reconcile_task(
     # RUNNING: normalize and transition based on session state
     elif state == db.State.RUNNING:
         if not session:
-            logger.warning(f"Task {fp} is RUNNING but has no session")
-            return
+            # Fallback: try to get session directly by ID if insights list was incomplete
+            current_attempt = db.get_current_attempt(fp)
+            if current_attempt and current_attempt.get("session_id"):
+                session_id = current_attempt.get("session_id")
+                logger.info(f"Task {fp} not in insights list, fetching session {session_id} directly")
+                session = devin_client.get_session(session_id)
+                if not session:
+                    logger.warning(f"Task {fp} is RUNNING but session {session_id} not found")
+                    return
+            else:
+                logger.warning(f"Task {fp} is RUNNING but has no session")
+                return
         
         normalized = normalize(session.get("status"), session.get("status_detail"))
         
@@ -246,6 +284,7 @@ async def reconcile_task(
                         outcome="completed",
                         claim_json=pr_info.get("structured_output"),
                         acus_consumed=acus_consumed,
+                        ended_at=datetime.utcnow().isoformat(),
                     )
                 
                 if db.transition(fp, db.State.RUNNING, db.State.VERIFYING, acus_total=new_acus_total):
@@ -348,7 +387,7 @@ async def create_session(fp: str, task: Dict[str, Any], devin_client) -> None:
     except Exception as e:
         logger.error(f"Failed to create session for task {fp}: {e}")
         # Mark attempt as failed
-        db.finish_attempt(attempt_id, outcome="failed")
+        db.finish_attempt(attempt_id, outcome="failed", ended_at=datetime.utcnow().isoformat())
 
 
 async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict[str, Any]], issue: Optional[Dict[str, Any]], github_client) -> None:
@@ -435,6 +474,7 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
             verdict_passed=1 if verdict.passed else 0,
             gate_failed=verdict.gate,
             evidence_json=verdict.evidence,
+            ended_at=datetime.utcnow().isoformat(),
         )
     
     # Handle verdict
