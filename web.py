@@ -110,7 +110,8 @@ async def status() -> str:
         agent_claims = trust_result["total_claims"] if trust_result and trust_result["total_claims"] else 0
         verifier_confirmed = trust_result["confirmed"] if trust_result and trust_result["confirmed"] else 0
         verifier_caught = trust_result["caught"] if trust_result and trust_result["caught"] else 0
-        
+        trust_rate_str = f"{(verifier_confirmed / agent_claims * 100):.0f}%" if agent_claims else "—"
+
         # COST: ROI calculation
         cursor = conn.execute("""
             SELECT 
@@ -164,7 +165,17 @@ async def status() -> str:
     quarantined = state_counts.get("QUARANTINED", 0)
     needs_human = state_counts.get("BLOCKED", 0)
     failed = state_counts.get("FAILED", 0)
-    
+    needs_attention = needs_human + quarantined + failed
+
+    # Sort tasks by what needs a human first, not just recency.
+    # BLOCKED/QUARANTINED/FAILED need action now; READY is waiting on a merge;
+    # RUNNING/VERIFYING/PENDING are in flight; MERGED is done.
+    state_priority = {
+        "BLOCKED": 0, "QUARANTINED": 1, "FAILED": 2, "READY": 3,
+        "RUNNING": 4, "VERIFYING": 4, "PENDING": 5, "MERGED": 6,
+    }
+    tasks.sort(key=lambda t: state_priority.get(t["state"], 99))
+
     # Check HALT latch and liveness (import reconciler module to access the globals)
     halt_banner = ""
     last_tick_str = "never"
@@ -218,14 +229,15 @@ async def status() -> str:
             table {{ border-collapse: collapse; width: 100%; }}
             th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
             th {{ background-color: #f2f2f2; }}
-            .state-PENDING {{ background-color: #fff3cd; }}
-            .state-RUNNING {{ background-color: #d1ecf1; }}
-            .state-VERIFYING {{ background-color: #d1ecf1; }}
-            .state-READY {{ background-color: #d4edda; }}
+            .summary {{ margin-bottom: 20px; font-weight: bold; }}
+            .state-PENDING {{ background-color: #f1f1f1; }}
+            .state-RUNNING {{ background-color: #f1f1f1; }}
+            .state-VERIFYING {{ background-color: #e2e3e5; }}
+            .state-READY {{ background-color: #cfe2ff; }}
             .state-MERGED {{ background-color: #d4edda; }}
             .state-QUARANTINED {{ background-color: #f8d7da; }}
             .state-FAILED {{ background-color: #f8d7da; }}
-            .state-BLOCKED {{ background-color: #fff3cd; }}
+            .state-BLOCKED {{ background-color: #ffe5b4; }}
             .claim-verdict {{ font-weight: bold; color: #333; }}
         </style>
     </head>
@@ -234,22 +246,26 @@ async def status() -> str:
         <div class="header">
             today: {acus_today:.1f} / {config.DAILY_ACU_CEILING} ACU · last tick {last_tick_str}
         </div>
-        
+
+        <div class="summary">
+            {needs_attention} need attention ({needs_human} blocked · {quarantined} quarantined · {failed} failed) · {verified} ready to merge · {merged} merged
+        </div>
+
         {halt_banner}
         {exception_banner}
-        
+
         <div class="metrics">
             <div class="metric-row">
                 <span class="metric-label">TRUST</span>
-                <span>agent claimed fixed {agent_claims}× → verifier confirmed {verifier_confirmed}, caught {verifier_caught}</span>
+                <span>{trust_rate_str} · {agent_claims} claims · {verifier_confirmed} confirmed · {verifier_caught} caught</span>
             </div>
             <div class="metric-row">
                 <span class="metric-label">COST</span>
-                <span>{total_acus_all:.1f} ACU → {merged_prs} merged PRs{f' · avg find→verified {avg_cycle_time:.0f}m' if avg_cycle_time else ''}</span>
+                <span>{total_acus_all:.1f} ACU · {merged_prs} merged PRs{f' · avg find→verified {avg_cycle_time:.0f}m' if avg_cycle_time else ''}</span>
             </div>
             <div class="metric-row">
                 <span class="metric-label">GATES</span>
-                <span>rejections by gate: {f' · '.join([f'{gate} {count}' for gate, count in gate_failures.items()]) if gate_failures else 'none'}</span>
+                <span>{f' · '.join([f'{gate} {count}' for gate, count in gate_failures.items()]) if gate_failures else 'none'}</span>
             </div>
         </div>
         
@@ -404,8 +420,8 @@ def build_claim_verdict(task: dict) -> str:
             verdict = "pending"
         
         parts.append(f"{claim_text} → {verdict}")
-    
-    return " → ".join(parts)
+
+    return " · ".join(parts)
 
 
 @app.post("/scan")

@@ -28,6 +28,7 @@ class VerifyContext:
     changed_files: List[str]
     diff: str
     repo_path: Path
+    known_fingerprints: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -302,11 +303,31 @@ def _gate_oracle(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
     
     evidence["bandit_fingerprints_after"] = list(current_fingerprints)
     evidence["bandit_finding_count"] = len(findings)
-    
-    # In a real implementation, we would compare against baseline fingerprints
-    # For now, we just verify that Bandit ran successfully
-    # The full logic will be implemented when we have the baseline
-    
+
+    # The fingerprint this task was opened for must be gone.
+    if ctx.fp in current_fingerprints:
+        return Verdict(
+            passed=False,
+            gate="oracle",
+            reason=f"Fingerprint {ctx.fp} is still present after the fix. The finding was not resolved.",
+            evidence=evidence,
+            counts_as_attempt=True,
+        )
+
+    # Any fingerprint that isn't already known to the ledger is a new finding
+    # introduced by this change.
+    baseline = set(ctx.known_fingerprints) | {ctx.fp}
+    new_fingerprints = current_fingerprints - baseline
+    if new_fingerprints:
+        evidence["bandit_new_fingerprints"] = sorted(new_fingerprints)
+        return Verdict(
+            passed=False,
+            gate="oracle",
+            reason=f"Fix introduced {len(new_fingerprints)} new finding(s): {', '.join(sorted(new_fingerprints))}",
+            evidence=evidence,
+            counts_as_attempt=True,
+        )
+
     evidence["gates_passed"].append("oracle")
     return Verdict(
         passed=True,

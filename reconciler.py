@@ -457,6 +457,7 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         changed_files=changed_files,
         diff=diff,
         repo_path=Path("."),  # Assumes running in repo root
+        known_fingerprints=[t["fp"] for t in db.list_tasks()],
     )
     
     # Run verifier
