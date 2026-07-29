@@ -10,9 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
 
-import config
-import db
-from github import get_client
+from cognition.core import config, db
+from cognition.api import github
 
 
 @dataclass
@@ -133,7 +132,7 @@ def sync_findings(findings: List[Finding]) -> None:
     Args:
         findings: List of Finding objects to sync.
     """
-    github_client = get_client()
+    github_client = github.get_client()
     
     for finding in findings:
         # Generate fingerprint

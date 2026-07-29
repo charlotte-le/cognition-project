@@ -7,15 +7,15 @@ two correct PRs at attempt 1 of 2, so it is pinned here.
 
 import pytest
 
-import config
-from reconciler import (
+from cognition.core import config
+from cognition.core.reconciler import (
     OUTCOME_QUARANTINE,
     OUTCOME_READY,
     OUTCOME_RETRY,
     OUTCOME_WAIT,
     decide_outcome,
 )
-from verifier import Verdict
+from cognition.verification.verifier import Verdict
 
 
 def _passed() -> Verdict:

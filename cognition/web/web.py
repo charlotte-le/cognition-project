@@ -17,9 +17,8 @@ from typing import Optional
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-import config
-import db
-from scanner import scan, sync_findings
+from cognition.core import config, db
+from cognition.verification import scanner
 
 app = FastAPI(title="cognition-project")
 
@@ -633,10 +632,10 @@ async def trigger_scan() -> Response:
     """
     try:
         # Scan the repo under review, not the directory this process runs in.
-        findings = scan(config.TARGET_REPO_PATH)
+        findings = scanner.scan(config.TARGET_REPO_PATH)
 
         # Sync findings to database
-        sync_findings(findings)
+        scanner.sync_findings(findings)
         
         return Response(content=f"Scan complete. {len(findings)} findings synced.", status_code=200)
     except Exception as e:

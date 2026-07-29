@@ -14,8 +14,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import config
-from scanner import fingerprint, branch_name
+from cognition.core import config
+from cognition.verification import scanner
 
 
 # pytest exit codes. Only TESTS_FAILED is a statement about the change under
@@ -246,7 +246,7 @@ def _gate_join(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
     
     If any fail: the PR is not provably the artifact for this task.
     """
-    expected_branch = branch_name(ctx.fp)
+    expected_branch = scanner.branch_name(ctx.fp)
     expected_fixes = f"Fixes #{ctx.issue_number}"
     expected_footer = f"<!-- cognition-project:fp={ctx.fp} -->"
     
@@ -471,7 +471,7 @@ def _gate_oracle(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
         if f.get("test_id") in config.RULE_ALLOWLIST
     ]
     current_fingerprints = {
-        fingerprint(
+        scanner.fingerprint(
             finding.get("test_id", ""),
             finding.get("filename", ""),
             finding.get("code", ""),

@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Optional, List, Dict, Any
 import json
 
-import config
+from cognition.core import config
 
 
 class State(str, Enum):
@@ -21,8 +21,6 @@ class State(str, Enum):
 
 def _get_db_path() -> str:
     """Ensure the parent directory exists and return the database path."""
-    # Import config here to get the current value
-    import config
     db_path = config.DB_PATH
     parent_dir = os.path.dirname(db_path)
     if parent_dir and not os.path.exists(parent_dir):

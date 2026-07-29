@@ -17,11 +17,11 @@ def fresh_db():
     os.environ["DB_PATH"] = db_path
     
     # Reload config to pick up the new DB_PATH
-    import config
+    from cognition.core import config
     importlib.reload(config)
     
     # Reload db to pick up the new config
-    import db
+    from cognition.core import db
     importlib.reload(db)
     
     db.init_db()
@@ -33,7 +33,7 @@ def fresh_db():
 
 def test_upsert_task_twice_inserts_once():
     """Test that upsert_task twice inserts only once."""
-    import db
+    from cognition.core import db
     fp = "test-file.py"
     payload = {"fingerprint": fp, "severity": "high"}
     
@@ -54,7 +54,7 @@ def test_upsert_task_twice_inserts_once():
 
 def test_transition_from_wrong_state_returns_false():
     """Test that transition from the wrong state returns False and changes nothing."""
-    import db
+    from cognition.core import db
     fp = "test-wrong-state.py"
     db.upsert_task(fp, "BanditFinding", {"fingerprint": fp})
     
@@ -69,7 +69,7 @@ def test_transition_from_wrong_state_returns_false():
 
 def test_transition_from_right_state_returns_true():
     """Test that transition from the right state returns True."""
-    import db
+    from cognition.core import db
     fp = "test-right-state.py"
     db.upsert_task(fp, "BanditFinding", {"fingerprint": fp})
     
@@ -84,7 +84,7 @@ def test_transition_from_right_state_returns_true():
 
 def test_unique_fp_attempt_no_rejects_duplicate():
     """Test that UNIQUE(fp, attempt_no) rejects duplicate attempts."""
-    import db
+    from cognition.core import db
     fp = "test-unique-attempt.py"
     db.upsert_task(fp, "BanditFinding", {"fingerprint": fp})
     db.transition(fp, db.State.PENDING, db.State.RUNNING)
@@ -104,7 +104,7 @@ def test_unique_fp_attempt_no_rejects_duplicate():
 
 def test_state_transitions_chain():
     """Test a complete chain of state transitions."""
-    import db
+    from cognition.core import db
     fp = "test-chain.py"
     db.upsert_task(fp, "BanditFinding", {"fingerprint": fp})
     
@@ -119,7 +119,7 @@ def test_state_transitions_chain():
 
 def test_transition_with_additional_fields():
     """Test that transition can update additional fields."""
-    import db
+    from cognition.core import db
     fp = "test-fields.py"
     db.upsert_task(fp, "BanditFinding", {"fingerprint": fp})
     
@@ -140,7 +140,7 @@ def test_transition_with_additional_fields():
 
 def test_start_and_finish_attempt():
     """Test starting and finishing an attempt."""
-    import db
+    from cognition.core import db
     fp = "test-attempt-lifecycle.py"
     db.upsert_task(fp, "BanditFinding", {"fingerprint": fp})
     db.transition(fp, db.State.PENDING, db.State.RUNNING)

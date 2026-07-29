@@ -15,13 +15,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-import config
-import db
-from devin import get_client as get_devin_client, normalize, Internal
-from github import get_client as get_github_client
-from prompts import render_brief, structured_output_schema
-from scanner import branch_name
-from verifier import verify, VerifyContext, Verdict
+from cognition.core import config, db, prompts
+from cognition.api import devin, github
+from cognition.verification import scanner, verifier
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +53,7 @@ OUTCOME_QUARANTINE = "quarantine"
 OUTCOME_WAIT = "wait"
 
 
-def _skipped_gates_note(verdict: Verdict) -> str:
+def _skipped_gates_note(verdict: verifier.Verdict) -> str:
     """Spell out any gate that did not run, so 'verified' is never read too broadly."""
     skipped = verdict.evidence.get("gates_skipped") or []
     if not skipped:
@@ -67,7 +63,7 @@ def _skipped_gates_note(verdict: Verdict) -> str:
     return f"\n**Gates skipped:** {', '.join(skipped)}{f' — {reason}' if reason else ''}\n"
 
 
-def decide_outcome(verdict: Verdict, attempt_count: int) -> str:
+def decide_outcome(verdict: verifier.Verdict, attempt_count: int) -> str:
     """Map a verdict onto the transition it should cause.
 
     Split out from run_verification so this policy is testable without a GitHub
@@ -205,8 +201,8 @@ async def tick() -> None:
     _last_tick_exception = None
     _orphaned_session_count = 0
     
-    github_client = get_github_client()
-    devin_client = get_devin_client()
+    github_client = github.get_client()
+    devin_client = devin.get_client()
     
     # Fetch desired state: open issues labeled cognition-project:auto
     try:
@@ -325,7 +321,7 @@ async def reconcile_task(
                 logger.warning(f"Task {fp} is RUNNING but has no session")
                 return
         
-        normalized = normalize(session.get("status"), session.get("status_detail"))
+        normalized = devin.normalize(session.get("status"), session.get("status_detail"))
         
         # Check wall clock. Measured from when the attempt started, not from
         # task.updated_at - that field moves on any DB write, so it counts
@@ -340,7 +336,7 @@ async def reconcile_task(
             return
         
         # RUNNING -> BLOCKED: agent asked a question
-        if normalized == Internal.BLOCKED:
+        if normalized == devin.Internal.BLOCKED:
             if db.transition(fp, db.State.RUNNING, db.State.BLOCKED):
                 logger.info(f"Task {fp} -> BLOCKED (agent asked question)")
                 # Comment on issue with agent's question and session link
@@ -351,16 +347,16 @@ async def reconcile_task(
                     github_client.comment(issue.get("number"), comment)
         
         # RUNNING -> VERIFYING: session completed, harvest PR
-        elif normalized == Internal.DONE:
+        elif normalized == devin.Internal.DONE:
             move_to_verifying(fp, task, session, db.State.RUNNING)
         
         # RUNNING -> FAILED: session failed
-        elif normalized == Internal.FAILED:
+        elif normalized == devin.Internal.FAILED:
             if db.transition(fp, db.State.RUNNING, db.State.FAILED):
                 logger.info(f"Task {fp} -> FAILED (session failed)")
         
         # RUNNING -> HALT: HALT signal from platform
-        elif normalized == Internal.HALT:
+        elif normalized == devin.Internal.HALT:
             global _halt_latched
             _halt_latched = True
             logger.error(f"HALT signal received from platform for task {fp}")
@@ -391,7 +387,7 @@ async def reconcile_task(
             if harvest_pr(session):
                 move_to_verifying(fp, task, session, db.State.BLOCKED)
             else:
-                normalized = normalize(session.get("status"), session.get("status_detail"))
+                normalized = devin.normalize(session.get("status"), session.get("status_detail"))
                 if normalized == Internal.RUNNING:
                     if db.transition(fp, db.State.BLOCKED, db.State.RUNNING):
                         logger.info(f"Task {fp} -> RUNNING (resumed)")
@@ -418,7 +414,7 @@ async def create_session(fp: str, task: Dict[str, Any], devin_client) -> None:
     db.transition(fp, db.State.PENDING, db.State.PENDING, current_attempt_id=attempt_id)
     
     # Render brief
-    brief = render_brief(task, attempt_no)
+    brief = prompts.render_brief(task, attempt_no)
     
     # Build session title
     payload = task.get("payload_json", {})
@@ -436,7 +432,7 @@ async def create_session(fp: str, task: Dict[str, Any], devin_client) -> None:
         response = devin_client.create_session(
             prompt=brief,
             title=title,
-            schema=structured_output_schema()
+            schema=prompts.structured_output_schema()
         )
         
         # Update attempt with session info
@@ -491,7 +487,7 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
     
     # Get PR details from GitHub
     try:
-        pr = github_client.find_pr_for_branch(branch_name(fp))
+        pr = github_client.find_pr_for_branch(scanner.branch_name(fp))
         if not pr:
             logger.warning(f"PR not found for task {fp}")
             return
@@ -525,11 +521,11 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         if t_payload.get("test_id") == current_rule_id:
             same_rule_fingerprints.append(t["fp"])
     
-    ctx = VerifyContext(
+    ctx = verifier.VerifyContext(
         fp=fp,
         rule_id=current_rule_id,
         issue_number=task.get("issue_number"),
-        branch=branch_name(fp),
+        branch=scanner.branch_name(fp),
         pr_number=pr_number,
         pr_head_sha=pr.get("head_sha", ""),
         pr_body=pr.get("body", ""),
@@ -541,7 +537,7 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
     
     # Run verifier
     try:
-        verdict = verify(ctx)
+        verdict = verifier.verify(ctx)
     except Exception as e:
         logger.error(f"Verification failed for task {fp}: {e}")
         return

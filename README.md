@@ -10,7 +10,43 @@ cognition-project is a small service that runs one closed loop against a fork of
 
 The load-bearing word is *independently*. Devin reports what it did. The verifier decides whether that report is true, using deterministic checks the agent cannot reach or influence.
 
-One container, one process, roughly 400 lines of Python, built in a day against the real Devin v3 API.
+One container, one process, organized as a proper Python package, built in a day against the real Devin v3 API.
+
+## Project Structure
+
+The codebase is organized as a proper Python package with clear separation of concerns:
+
+```
+cognition-project/
+├── cognition/                    # Main package
+│   ├── __init__.py
+│   ├── core/                     # Core orchestration & data layer
+│   │   ├── __init__.py
+│   │   ├── db.py                # SQLite database operations
+│   │   ├── config.py            # Configuration management
+│   │   ├── reconciler.py        # Main orchestration loop
+│   │   └── prompts.py           # AI prompt templates
+│   ├── verification/             # Verification & scanning
+│   │   ├── __init__.py
+│   │   ├── scanner.py           # Bandit scanner integration
+│   │   └── verifier.py          # Five-gate verification engine
+│   ├── api/                      # External API clients
+│   │   ├── __init__.py
+│   │   ├── devin.py             # Devin API client
+│   │   └── github.py            # GitHub API client
+│   └── web/                      # Web interface
+│       ├── __init__.py
+│       └── web.py               # FastAPI application
+├── tests/                        # Test suite
+│   ├── test_db.py
+│   ├── test_reconciler.py
+│   ├── test_verifier.py
+│   └── smoke.py
+├── main.py                       # Application entry point
+├── Dockerfile                    # Container definition
+├── docker-compose.yml            # Container orchestration
+└── requirements.txt              # Python dependencies
+```
 
 ## Architecture
 
@@ -53,36 +89,45 @@ PENDING ──► RUNNING ──► VERIFYING ──► READY ──► MERGED
         a question)     rejections)
 ```
 
-## Run Modes
+## Running the Service
 
-Both modes use `docker compose up`.
+The service runs as a single container handling both the reconciler loop and web interface.
 
-### Demo Mode (No credentials)
+### Prerequisites
 
-When no `.env` file is present, the system runs in demo mode:
-- Pre-seeded database with realistic sample data
-- Status page renders immediately at http://localhost:8000/status
-- No live API calls to Devin or GitHub
-- Perfect for demonstrating the interface and data model
+- Docker and Docker Compose installed
+- For live mode: Devin API credentials and GitHub token
 
-### Live Mode
+### Configuration
 
-With real credentials in `.env`:
-- Fill in `.env` with your Devin API key, org ID, and GitHub token
-- POST /scan to trigger a Bandit scan
-- Watch the reconciler loop create sessions, verify PRs, and manage the task lifecycle
-- Real integration with Devin v3 API and GitHub
+Copy `.env.example` to `.env` and configure:
 
-## Environment Variables
+```bash
+cp .env.example .env
+```
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DEVIN_API_BASE` | Devin API base URL | `https://api.devin.ai` |
-| `DEVIN_API_KEY` | Devin API key (service user with `ManageOrgSessions`) | (empty) |
-| `DEVIN_ORG_ID` | Devin organization ID | (empty) |
-| `GITHUB_REPO` | GitHub repository in format `owner/repo` | `owner/repo` |
-| `GITHUB_TOKEN` | GitHub personal access token | (empty) |
-| `DRY_RUN` | Dry run mode - skip actual API calls | `true` |
+Required environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `DEVIN_API_KEY` | Devin API key (service user with `ManageOrgSessions`) |
+| `DEVIN_ORG_ID` | Devin organization ID |
+| `GITHUB_TOKEN` | GitHub personal access token |
+| `GITHUB_REPO` | GitHub repository in format `owner/repo` |
+
+### Starting the Service
+
+```bash
+docker compose up
+```
+
+The status page will be available at http://localhost:8000/status
+
+### Usage
+
+- **Trigger a scan**: POST to `/scan` endpoint to run Bandit against the target repository
+- **View status**: Visit `/status` for real-time task and fleet status
+- **Webhook integration**: Configure GitHub webhook to POST to `/webhook` for issue-driven processing
 
 ## The Verifier
 
@@ -118,14 +163,36 @@ These metrics are defined but not built at n = 12. The current demo shows the da
 
 ## Development
 
-Run locally without Docker:
+### Running Locally
+
+Install dependencies and run:
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-Run with Docker:
+The application will start the reconciler loop and web server, with the status page available at http://localhost:8000/status
+
+### Running Tests
+
+Run the test suite:
+
+```bash
+pytest tests/
+```
+
+Or run specific test files:
+
+```bash
+pytest tests/test_db.py
+pytest tests/test_reconciler.py
+pytest tests/test_verifier.py
+```
+
+### Running with Docker
+
+Build and run with Docker Compose:
 
 ```bash
 docker compose up

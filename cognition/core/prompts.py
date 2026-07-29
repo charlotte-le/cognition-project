@@ -5,8 +5,8 @@ This module renders the brief for Devin sessions and defines the structured outp
 
 from typing import Dict, Any, Optional
 
-import config
-from scanner import branch_name
+from cognition.core import config
+from cognition.verification import scanner
 
 
 def render_brief(task: Dict[str, Any], attempt_no: int, prior_verdict: Optional[str] = None) -> str:
@@ -94,7 +94,7 @@ All tests must pass.
 
 ## Branch and PR contract
 
-1. Create a branch named exactly: `{branch_name(fp)}`
+1. Create a branch named exactly: `{scanner.branch_name(fp)}`
 2. Open a PR with a body containing:
    - `Fixes #{issue_number}`
    - This footer: `<!-- cognition-project:fp={fp} -->`

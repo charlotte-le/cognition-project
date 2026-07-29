@@ -9,12 +9,12 @@ import subprocess
 import pytest
 from pathlib import Path
 
-import config
-import verifier
-from verifier import VerifyContext, verify
+from cognition.core import config
+from cognition.verification import verifier
+from cognition.verification.verifier import VerifyContext, verify
 
-# Use current directory for tests that need a valid path
-TEST_REPO_PATH = Path("/Users/charlottele/Desktop/cognition-project")
+# Use project root directory for tests that need a valid path
+TEST_REPO_PATH = Path(__file__).parent
 
 
 class TestGate1Join:

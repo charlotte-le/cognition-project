@@ -5,7 +5,7 @@ import time
 import logging
 import uuid
 
-import config
+from cognition.core import config
 
 logger = logging.getLogger(__name__)
 

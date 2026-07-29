@@ -6,14 +6,11 @@ One asyncio loop means ticks are serialized, so no locking is needed anywhere.
 
 import asyncio
 import logging
-import os
 import sys
 
 import uvicorn
-import db
-import config
-import reconciler
-import web
+from cognition.core import db, config, reconciler
+from cognition.web import web
 
 # Configure logging
 logging.basicConfig(
@@ -47,36 +44,11 @@ async def main():
     logger.info("Initializing database")
     db.init_db()
     
-    # Check if running in demo mode (no credentials or demo credentials)
-    demo_mode = (
-        not os.environ.get("DEVIN_API_KEY") or 
-        not os.environ.get("DEVIN_ORG_ID") or
-        os.environ.get("DEVIN_API_KEY") == "demo-key" or
-        os.environ.get("DEVIN_ORG_ID") == "demo-org"
-    )
-    
-    if demo_mode:
-        logger.info("Running in DEMO mode - no live API calls")
-        # Seed demo data if database is empty
-        tasks = db.list_tasks()
-        if not tasks:
-            logger.info("Seeding demo data")
-            import seed_demo
-            seed_demo.seed_demo()
-    else:
-        logger.info("Running in LIVE mode")
-        # In live mode, start with clean database - no demo data
-        logger.info("Live mode - starting with clean database")
-    
     # Start reconciler loop and web server concurrently
     logger.info("Starting services")
     
-    # Only start reconciler in live mode (with real credentials)
-    if not demo_mode:
-        reconciler_loop = asyncio.create_task(reconciler_task())
-    else:
-        reconciler_loop = None
-        logger.info("Demo mode - reconciler loop not started")
+    # Start reconciler loop
+    reconciler_loop = asyncio.create_task(reconciler_task())
     
     # Configure uvicorn
     uvicorn_config = uvicorn.Config(
@@ -91,12 +63,11 @@ async def main():
     await server.serve()
     
     # Clean shutdown
-    if reconciler_loop:
-        reconciler_loop.cancel()
-        try:
-            await reconciler_loop
-        except asyncio.CancelledError:
-            pass
+    reconciler_loop.cancel()
+    try:
+        await reconciler_loop
+    except asyncio.CancelledError:
+        pass
 
 
 if __name__ == "__main__":

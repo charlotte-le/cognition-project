@@ -2,7 +2,7 @@ import httpx
 from typing import Optional, Dict, Any, List, Union
 import logging
 
-import config
+from cognition.core import config
 
 logger = logging.getLogger(__name__)
 
