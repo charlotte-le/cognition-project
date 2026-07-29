@@ -6,8 +6,12 @@ services:
     env_file:
       - .env.example
       - .env  # Optional - override defaults with real credentials
+    environment:
+      - TARGET_REPO_PATH=/repo
     volumes:
       - cognition-data:/data
+      # Checkout of the repo under review. Bandit and the tests run here.
+      - ${TARGET_REPO_HOST_PATH:-../superset}:/repo
     restart: unless-stopped
 
 volumes:

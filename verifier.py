@@ -6,13 +6,28 @@ making it testable against hand-written diffs.
 """
 
 import json
+import shutil
 import subprocess
-from dataclasses import dataclass, field
+import sys
+import tempfile
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import config
-from scanner import fingerprint
+from scanner import fingerprint, branch_name
+
+
+# pytest exit codes. Only TESTS_FAILED is a statement about the change under
+# review; the rest mean the run never produced a usable answer.
+PYTEST_OK = 0
+PYTEST_TESTS_FAILED = 1
+PYTEST_INFRA_CODES = {
+    2: "test run was interrupted",
+    3: "internal error in pytest",
+    4: "pytest usage error (test path likely missing)",
+    5: "no tests were collected",
+}
 
 
 @dataclass
@@ -68,25 +83,156 @@ def verify(ctx: VerifyContext) -> Verdict:
     if not result.passed:
         return result
     
-    # Gate 3: Oracle
-    result = _gate_oracle(ctx, evidence)
-    if not result.passed:
-        return result
-    
-    # Gate 4: Tests
-    result = _gate_tests(ctx, evidence)
-    if not result.passed:
-        return result
-    
-    # All gates passed
-    evidence["gates_passed"] = ["join", "policy", "oracle", "tests"]
+    # Gates 3 and 4 must run against the code the PR proposes, not against
+    # whatever branch the shared checkout happens to be sitting on.
+    scratch, checkout_failure = _checkout_pr(ctx, evidence)
+    if checkout_failure is not None:
+        return checkout_failure
+
+    try:
+        pr_ctx = replace(ctx, repo_path=scratch)
+
+        # Gate 3: Oracle
+        result = _gate_oracle(pr_ctx, evidence)
+        if not result.passed:
+            return result
+
+        # Gate 4: Tests, when the environment can actually run them.
+        if config.RUN_TESTS_GATE:
+            result = _gate_tests(pr_ctx, evidence)
+            if not result.passed:
+                return result
+        else:
+            evidence["gates_skipped"] = ["tests"]
+            evidence["tests_skipped_reason"] = (
+                "RUN_TESTS_GATE is off: this verifier does not carry the target "
+                "repo's dependencies, so it cannot run its test suite."
+            )
+    finally:
+        _cleanup_checkout(scratch)
+
+    # gates_passed is whatever the gates themselves appended. Never assert that
+    # a gate ran when it did not - a caller reading this list is deciding how
+    # much the word "verified" is worth.
     return Verdict(
         passed=True,
         gate=None,
-        reason="All verification gates passed.",
+        reason=f"Verification gates passed: {', '.join(evidence['gates_passed'])}.",
         evidence=evidence,
         counts_as_attempt=True,
     )
+
+
+def _redact(text: str) -> str:
+    """Strip the GitHub token out of anything headed for logs or evidence."""
+    if config.GITHUB_TOKEN:
+        return text.replace(config.GITHUB_TOKEN, "***")
+    return text
+
+
+def _remote_url() -> str:
+    """Clone URL for the repo the PR lives on.
+
+    Deliberately not the local checkout's origin: the target repo is a fork,
+    and refs/pull/N/head means a different PR on every other remote.
+    """
+    if config.GITHUB_TOKEN:
+        return f"https://x-access-token:{config.GITHUB_TOKEN}@github.com/{config.GITHUB_REPO}.git"
+    return f"https://github.com/{config.GITHUB_REPO}.git"
+
+
+def _git(args: List[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=config.CHECKOUT_TIMEOUT,
+    )
+
+
+def _checkout_failure(reason: str, evidence: Dict[str, Any], scratch: Optional[Path]) -> Verdict:
+    """Every checkout problem is infra: it says nothing about the agent's work."""
+    _cleanup_checkout(scratch)
+    return Verdict(
+        passed=False,
+        gate="infra",
+        reason=_redact(reason),
+        evidence=evidence,
+        counts_as_attempt=False,
+    )
+
+
+def _checkout_pr(
+    ctx: VerifyContext, evidence: Dict[str, Any]
+) -> tuple[Optional[Path], Optional[Verdict]]:
+    """Materialize the PR's code in a throwaway working tree.
+
+    Fetches only the PR's head ref, shallow, into a fresh repository. The
+    operator's checkout is never read or written, so concurrent verifications
+    cannot collide and nothing local can contaminate the result: what gets
+    tested is exactly what the remote says the PR is.
+
+    Returns (path, None) on success, or (None, verdict) on failure.
+    """
+    if not ctx.pr_head_sha:
+        return None, _checkout_failure(
+            f"PR #{ctx.pr_number} has no head SHA; cannot pin the code under review",
+            evidence,
+            None,
+        )
+
+    scratch = Path(tempfile.mkdtemp(prefix=f"verify-{ctx.fp.replace(':', '-')}-"))
+    work = scratch / "repo"
+    work.mkdir()
+
+    result = _git(["init", "-q"], cwd=work)
+    if result.returncode != 0:
+        return None, _checkout_failure(
+            f"Could not initialize scratch repo: {result.stderr.strip()}", evidence, scratch
+        )
+
+    # refs/pull/N/head is stable even if the branch is later deleted.
+    result = _git(["fetch", "--depth=1", _remote_url(), f"refs/pull/{ctx.pr_number}/head"], cwd=work)
+    if result.returncode != 0:
+        return None, _checkout_failure(
+            f"Could not fetch PR #{ctx.pr_number} from {config.GITHUB_REPO}: "
+            f"{result.stderr.strip()}",
+            evidence,
+            scratch,
+        )
+
+    fetched = _git(["rev-parse", "FETCH_HEAD"], cwd=work).stdout.strip()
+
+    # The reconciler recorded a SHA when it read the PR. If what we fetched is
+    # a different commit, the PR moved underneath us and the diff that cleared
+    # gates 1 and 2 is not the code we are about to test.
+    if fetched != ctx.pr_head_sha:
+        return None, _checkout_failure(
+            f"PR #{ctx.pr_number} moved during verification: expected "
+            f"{ctx.pr_head_sha}, fetched {fetched}",
+            evidence,
+            scratch,
+        )
+
+    result = _git(["checkout", "--detach", fetched], cwd=work)
+    if result.returncode != 0:
+        return None, _checkout_failure(
+            f"Could not check out {fetched}: {result.stderr.strip()}", evidence, scratch
+        )
+
+    evidence["checkout_sha"] = fetched
+    evidence["checkout_source"] = f"{config.GITHUB_REPO}#{ctx.pr_number}"
+    return work, None
+
+
+def _cleanup_checkout(path: Optional[Path]) -> None:
+    """Remove the scratch tree. Never fatal - a leaked temp dir is not a verdict."""
+    if path is None:
+        return
+    # _checkout_pr works in <scratch>/repo; remove the whole scratch dir.
+    target = path.parent if path.name == "repo" else path
+    shutil.rmtree(target, ignore_errors=True)
 
 
 def _gate_join(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
@@ -100,7 +246,7 @@ def _gate_join(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
     
     If any fail: the PR is not provably the artifact for this task.
     """
-    expected_branch = f"cognition-project/{ctx.fp}"
+    expected_branch = branch_name(ctx.fp)
     expected_fixes = f"Fixes #{ctx.issue_number}"
     expected_footer = f"<!-- cognition-project:fp={ctx.fp} -->"
     
@@ -293,16 +439,49 @@ def _gate_oracle(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
             evidence=evidence,
             counts_as_attempt=True,
         )
-    
-    # Extract fingerprints
-    findings = bandit_output.get("results", [])
+
+    # A scan that scanned nothing proves nothing. --exit-zero makes Bandit
+    # return 0 even when the target path is missing, and the empty result set
+    # that comes back would otherwise clear every gate below it.
+    scan_errors = bandit_output.get("errors") or []
+    scanned_loc = bandit_output.get("metrics", {}).get("_totals", {}).get("loc", 0)
+    evidence["bandit_scan_errors"] = scan_errors
+    evidence["bandit_scanned_loc"] = scanned_loc
+
+    if scan_errors or not scanned_loc:
+        detail = scan_errors[0].get("reason", "unknown") if scan_errors else "no source read"
+        return Verdict(
+            passed=False,
+            gate="infra",
+            reason=(
+                f"Bandit scanned {scanned_loc} lines from {ctx.repo_path} "
+                f"({detail}). The scan target is unreadable, so the absence of "
+                f"fingerprint {ctx.fp} proves nothing."
+            ),
+            evidence=evidence,
+            counts_as_attempt=False,  # Infra failure, not a verified rejection
+        )
+
+    # Extract fingerprints. This must mirror scanner.scan() exactly: same rule
+    # filter, same JSON keys. The ledger only ever contains allowlisted rules,
+    # so comparing an unfiltered scan against it makes every finding from every
+    # untracked rule look like something this PR introduced.
+    findings = [
+        f for f in bandit_output.get("results", [])
+        if f.get("test_id") in config.RULE_ALLOWLIST
+    ]
     current_fingerprints = {
-        fingerprint(finding.get("test_id"), finding.get("file_path"), finding.get("code"))
+        fingerprint(
+            finding.get("test_id", ""),
+            finding.get("filename", ""),
+            finding.get("code", ""),
+        )
         for finding in findings
     }
-    
+
     evidence["bandit_fingerprints_after"] = list(current_fingerprints)
     evidence["bandit_finding_count"] = len(findings)
+    evidence["bandit_total_findings_unfiltered"] = len(bandit_output.get("results", []))
 
     # The fingerprint this task was opened for must be gone.
     if ctx.fp in current_fingerprints:
@@ -344,11 +523,12 @@ def _gate_tests(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
     Uses the mapping in config.TEST_MAPPING, defaulting to tests/unit_tests.
     Green (exit code 0) is required.
     """
-    # Determine which test subset to run
-    test_path = config.TEST_MAPPING.get("default", "tests/unit_tests")
+    # Determine which test subset to run - check rule-specific mapping first
+    test_path = config.TEST_MAPPING.get(ctx.rule_id, config.TEST_MAPPING.get("default", "tests/unit_tests"))
     
-    # Build test command
-    test_cmd = ["python", "-m", "pytest", test_path, "-v"]
+    # Build test command. sys.executable rather than "python", which does not
+    # exist on hosts where only python3 is on PATH.
+    test_cmd = [sys.executable, "-m", "pytest", test_path, "-v"]
     
     evidence["test_command"] = " ".join(test_cmd)
     
@@ -391,7 +571,31 @@ def _gate_tests(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
     evidence["test_stdout"] = result.stdout
     evidence["test_stderr"] = result.stderr
     
-    if result.returncode != 0:
+    if result.returncode != PYTEST_OK:
+        # `python -m pytest` always finds `python`, so a missing pytest comes
+        # back as exit 1 rather than the FileNotFoundError caught above.
+        if "No module named pytest" in result.stderr:
+            return Verdict(
+                passed=False,
+                gate="infra",
+                reason=f"pytest is not installed in the verifier environment ({ctx.repo_path})",
+                evidence=evidence,
+                counts_as_attempt=False,  # Infra failure, not a verified rejection
+            )
+
+        if result.returncode in PYTEST_INFRA_CODES:
+            return Verdict(
+                passed=False,
+                gate="infra",
+                reason=(
+                    f"Test run did not complete: "
+                    f"{PYTEST_INFRA_CODES[result.returncode]} "
+                    f"(pytest exit {result.returncode}, path '{test_path}')"
+                ),
+                evidence=evidence,
+                counts_as_attempt=False,  # Infra failure, not a verified rejection
+            )
+
         return Verdict(
             passed=False,
             gate="tests",
@@ -399,7 +603,7 @@ def _gate_tests(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
             evidence=evidence,
             counts_as_attempt=True,
         )
-    
+
     evidence["gates_passed"].append("tests")
     return Verdict(
         passed=True,

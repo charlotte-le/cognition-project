@@ -6,6 +6,7 @@ This module renders the brief for Devin sessions and defines the structured outp
 from typing import Dict, Any, Optional
 
 import config
+from scanner import branch_name
 
 
 def render_brief(task: Dict[str, Any], attempt_no: int, prior_verdict: Optional[str] = None) -> str:
@@ -86,14 +87,14 @@ Your fix MUST respect these limits:
 
 Before opening a PR, run this test subset:
 ```bash
-python -m pytest {config.TEST_MAPPING.get("default", "tests/unit_tests")} -v
+python -m pytest {config.TEST_MAPPING.get(rule_id, config.TEST_MAPPING.get("default", "tests/unit_tests"))} -v
 ```
 
 All tests must pass.
 
 ## Branch and PR contract
 
-1. Create a branch named exactly: `cognition-project/{fp}`
+1. Create a branch named exactly: `{branch_name(fp)}`
 2. Open a PR with a body containing:
    - `Fixes #{issue_number}`
    - This footer: `<!-- cognition-project:fp={fp} -->`

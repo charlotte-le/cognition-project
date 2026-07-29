@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Optional, Dict, Any, List
 import time
 import logging
+import uuid
 
 import config
 
@@ -81,6 +82,10 @@ class DevinClient:
         self.timeout = 30.0
         self._client = httpx.Client(timeout=self.timeout)
     
+    def _log_dry_run(self, operation: str, details: Dict[str, Any]) -> None:
+        """Log what would be done in DRY_RUN mode."""
+        logger.info(f"[DRY_RUN] Would {operation}: {details}")
+
     def _request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
         """Make HTTP request with simple backoff on 5xx errors."""
         url = f"{self.base_url}{path}"
@@ -119,6 +124,21 @@ class DevinClient:
         Returns SessionResponse with fields: session_id, url, status, acus_consumed.
         IMPORTANT: structured_output and status_detail are never populated on create response.
         """
+        if config.DRY_RUN:
+            self._log_dry_run("create_session", {
+                "title": title,
+                "repo": repo or config.GITHUB_REPO,
+                "max_acu": max_acu or config.MAX_ACU_PER_SESSION,
+                "prompt": prompt,
+            })
+            # Plausible fake values, shaped like a real create response.
+            return {
+                "session_id": f"dry-run-{uuid.uuid4().hex}",
+                "url": "https://app.devin.ai/sessions/dry-run",
+                "status": "new",
+                "acus_consumed": 0,
+            }
+
         body = {
             "prompt": prompt,
             "tags": [config.SESSION_TAG],
@@ -158,11 +178,12 @@ class DevinClient:
             f"/v3/organizations/{self.org_id}/sessions/insights"
         )
         
-        # Filter to sessions whose tags contain config.SESSION_TAG
+        # Filter to sessions whose tags contain config.SESSION_TAG and are not archived
         tagged_sessions = []
-        for session in response.get("sessions", []):
+        for session in response.get("items", []):
             tags = session.get("tags", [])
-            if config.SESSION_TAG in tags:
+            is_archived = session.get("is_archived", False)
+            if config.SESSION_TAG in tags and not is_archived:
                 tagged_sessions.append({
                     "session_id": session.get("session_id"),
                     "status": session.get("status"),
@@ -210,6 +231,13 @@ class DevinClient:
         Send a message to a session.
         Sending a message auto-resumes a suspended session.
         """
+        if config.DRY_RUN:
+            self._log_dry_run("send_message", {
+                "session_id": session_id,
+                "message": message,
+            })
+            return
+
         self._request(
             "POST",
             f"/v3/organizations/{self.org_id}/sessions/{session_id}/messages",

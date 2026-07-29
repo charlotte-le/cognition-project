@@ -5,7 +5,10 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install pinned Bandit version
+# Install pinned Bandit version. Bandit is static analysis, so the oracle gate
+# needs nothing from the target repo's dependency tree - which is what keeps
+# this image small. The tests gate is the part that would need that tree, and
+# it is off by default; see config.RUN_TESTS_GATE.
 RUN pip install --no-cache-dir bandit==1.7.9
 
 # Create non-root user

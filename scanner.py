@@ -52,6 +52,16 @@ def fingerprint(rule_id: str, path: str, code: str) -> str:
     return f"scan:{hash_digest}"
 
 
+def branch_name(fp: str) -> str:
+    """Build the git branch name for a task's fingerprint.
+
+    Git ref names cannot contain ':', so the fingerprint's colon is replaced
+    with a hyphen. This must be the single source of truth for that mapping —
+    prompts.py, reconciler.py, and verifier.py all need the identical result.
+    """
+    return f"cognition-project/{fp.replace(':', '-')}"
+
+
 def scan(repo_path: str) -> List[Finding]:
     """Run Bandit scan and return filtered findings.
     
@@ -92,7 +102,8 @@ def scan(repo_path: str) -> List[Finding]:
         
         finding = Finding(
             test_id=test_id,
-            file_path=result_item.get("file_path", ""),
+            # Bandit's JSON key is "filename"; there is no "file_path".
+            file_path=result_item.get("filename", ""),
             line_number=result_item.get("line_number", 0),
             code=result_item.get("code", ""),
             issue_text=result_item.get("issue_text", ""),

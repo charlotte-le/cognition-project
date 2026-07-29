@@ -20,6 +20,7 @@ import db
 from devin import get_client as get_devin_client, normalize, Internal
 from github import get_client as get_github_client
 from prompts import render_brief, structured_output_schema
+from scanner import branch_name
 from verifier import verify, VerifyContext, Verdict
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,47 @@ def get_last_tick_exception():
 def get_orphaned_session_count():
     """Get the count of orphaned sessions for anomaly monitoring."""
     return _orphaned_session_count
+
+
+# What a verification verdict means for the task's state.
+OUTCOME_READY = "ready"
+OUTCOME_RETRY = "retry"
+OUTCOME_QUARANTINE = "quarantine"
+OUTCOME_WAIT = "wait"
+
+
+def _skipped_gates_note(verdict: Verdict) -> str:
+    """Spell out any gate that did not run, so 'verified' is never read too broadly."""
+    skipped = verdict.evidence.get("gates_skipped") or []
+    if not skipped:
+        return ""
+
+    reason = verdict.evidence.get("tests_skipped_reason", "")
+    return f"\n**Gates skipped:** {', '.join(skipped)}{f' — {reason}' if reason else ''}\n"
+
+
+def decide_outcome(verdict: Verdict, attempt_count: int) -> str:
+    """Map a verdict onto the transition it should cause.
+
+    Split out from run_verification so this policy is testable without a GitHub
+    client, a Devin client, or a database - the routing here is what decides
+    whether real work gets thrown away.
+
+    An infra verdict (counts_as_attempt False) is a statement about the
+    verifier's own environment, not about the agent's work. It must neither burn
+    an attempt nor quarantine: the task waits in VERIFYING and the gates re-run
+    next tick, once the environment is fixed.
+    """
+    if verdict.passed:
+        return OUTCOME_READY
+
+    if not verdict.counts_as_attempt:
+        return OUTCOME_WAIT
+
+    if attempt_count < config.MAX_ATTEMPTS:
+        return OUTCOME_RETRY
+
+    return OUTCOME_QUARANTINE
 
 
 def can_admit(task: Dict[str, Any]) -> Tuple[bool, str]:
@@ -107,6 +149,45 @@ def harvest_pr(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "pr_state": pr.get("pr_state"),
         "pr_url": pr.get("pr_url"),
     }
+
+
+def move_to_verifying(fp: str, task: Dict[str, Any], session: Dict[str, Any], from_state: str) -> None:
+    """Harvest a session's PR and transition the task to VERIFYING.
+
+    A PR appearing on the session is treated as a stronger signal than the vendor's
+    own status label — the human may merge/act on the PR directly on GitHub without
+    ever resuming the session, so this is called from BLOCKED as well as RUNNING.
+
+    Args:
+        fp: Task fingerprint.
+        task: Task dictionary from the database.
+        session: Session dictionary from Devin API.
+        from_state: The state the task is transitioning from.
+    """
+    pr_info = harvest_pr(session)
+    if not pr_info:
+        logger.warning(f"Task {fp} session completed but no PR found")
+        return
+
+    # Update ACUs and transition to VERIFYING
+    acus_consumed = session.get("acus_consumed", 0)
+    new_acus_total = task.get("acus_total", 0) + acus_consumed
+
+    # Store structured_output in attempts table
+    attempt_id = task.get("current_attempt_id")  # This should be set when session created
+    if attempt_id:
+        db.finish_attempt(
+            attempt_id,
+            session_id=session.get("session_id"),
+            session_url=session.get("url"),
+            outcome="completed",
+            claim_json=pr_info.get("structured_output"),
+            acus_consumed=acus_consumed,
+            ended_at=datetime.utcnow().isoformat(),
+        )
+
+    if db.transition(fp, from_state, db.State.VERIFYING, acus_total=new_acus_total):
+        logger.info(f"Task {fp} -> VERIFYING (session completed)")
 
 
 async def tick() -> None:
@@ -246,9 +327,12 @@ async def reconcile_task(
         
         normalized = normalize(session.get("status"), session.get("status_detail"))
         
-        # Check wall clock
-        task_updated = datetime.fromisoformat(task.get("updated_at"))
-        wall_clock_minutes = (datetime.utcnow() - task_updated).total_seconds() / 60
+        # Check wall clock. Measured from when the attempt started, not from
+        # task.updated_at - that field moves on any DB write, so it counts
+        # reconciler downtime against the agent and kills work on restart.
+        attempt = db.get_current_attempt(fp)
+        started_at = (attempt or {}).get("started_at") or task.get("updated_at")
+        wall_clock_minutes = (datetime.utcnow() - datetime.fromisoformat(started_at)).total_seconds() / 60
         if wall_clock_minutes > config.WALL_CLOCK_MINUTES:
             logger.warning(f"Task {fp} wall clock exceeded ({wall_clock_minutes:.1f}m > {config.WALL_CLOCK_MINUTES}m)")
             if db.transition(fp, db.State.RUNNING, db.State.FAILED):
@@ -268,29 +352,7 @@ async def reconcile_task(
         
         # RUNNING -> VERIFYING: session completed, harvest PR
         elif normalized == Internal.DONE:
-            pr_info = harvest_pr(session)
-            if pr_info:
-                # Update ACUs and transition to VERIFYING
-                acus_consumed = session.get("acus_consumed", 0)
-                new_acus_total = task.get("acus_total", 0) + acus_consumed
-                
-                # Store structured_output in attempts table
-                attempt_id = task.get("current_attempt_id")  # This should be set when session created
-                if attempt_id:
-                    db.finish_attempt(
-                        attempt_id,
-                        session_id=session.get("session_id"),
-                        session_url=session.get("url"),
-                        outcome="completed",
-                        claim_json=pr_info.get("structured_output"),
-                        acus_consumed=acus_consumed,
-                        ended_at=datetime.utcnow().isoformat(),
-                    )
-                
-                if db.transition(fp, db.State.RUNNING, db.State.VERIFYING, acus_total=new_acus_total):
-                    logger.info(f"Task {fp} -> VERIFYING (session completed)")
-            else:
-                logger.warning(f"Task {fp} session completed but no PR found")
+            move_to_verifying(fp, task, session, db.State.RUNNING)
         
         # RUNNING -> FAILED: session failed
         elif normalized == Internal.FAILED:
@@ -307,7 +369,7 @@ async def reconcile_task(
     
     # VERIFYING: run the verifier
     elif state == db.State.VERIFYING:
-        await run_verification(fp, task, session, issue, github_client)
+        await run_verification(fp, task, session, issue, github_client, devin_client)
     
     # READY: check if PR is merged
     elif state == db.State.READY:
@@ -322,13 +384,17 @@ async def reconcile_task(
                 if issue:
                     github_client.close_issue(issue.get("number"))
     
-    # BLOCKED: can be resumed if session becomes RUNNING again
+    # BLOCKED: can be resumed if session becomes RUNNING again, or the PR may have
+    # already been merged/acted on directly on GitHub while the session sat waiting
     elif state == db.State.BLOCKED:
         if session:
-            normalized = normalize(session.get("status"), session.get("status_detail"))
-            if normalized == Internal.RUNNING:
-                if db.transition(fp, db.State.BLOCKED, db.State.RUNNING):
-                    logger.info(f"Task {fp} -> RUNNING (resumed)")
+            if harvest_pr(session):
+                move_to_verifying(fp, task, session, db.State.BLOCKED)
+            else:
+                normalized = normalize(session.get("status"), session.get("status_detail"))
+                if normalized == Internal.RUNNING:
+                    if db.transition(fp, db.State.BLOCKED, db.State.RUNNING):
+                        logger.info(f"Task {fp} -> RUNNING (resumed)")
 
 
 async def create_session(fp: str, task: Dict[str, Any], devin_client) -> None:
@@ -390,15 +456,16 @@ async def create_session(fp: str, task: Dict[str, Any], devin_client) -> None:
         db.finish_attempt(attempt_id, outcome="failed", ended_at=datetime.utcnow().isoformat())
 
 
-async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict[str, Any]], issue: Optional[Dict[str, Any]], github_client) -> None:
+async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict[str, Any]], issue: Optional[Dict[str, Any]], github_client, devin_client) -> None:
     """Run verification for a task.
-    
+
     Args:
         fp: Task fingerprint.
         task: Task dictionary from the database.
         session: Session dictionary from Devin API.
         issue: Issue dictionary from GitHub API.
         github_client: GitHub client instance.
+        devin_client: Devin client instance.
     """
     if not session:
         logger.warning(f"Task {fp} is VERIFYING but has no session")
@@ -424,7 +491,7 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
     
     # Get PR details from GitHub
     try:
-        pr = github_client.find_pr_for_branch(f"cognition-project/{fp}")
+        pr = github_client.find_pr_for_branch(branch_name(fp))
         if not pr:
             logger.warning(f"PR not found for task {fp}")
             return
@@ -446,18 +513,30 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         import json
         payload = json.loads(payload)
     
+    # Get known fingerprints for the same rule only - comparing across rules
+    # causes false positives when the scanner filters by RULE_ALLOWLIST
+    current_rule_id = payload.get("test_id", "unknown")
+    all_tasks = db.list_tasks()
+    same_rule_fingerprints = []
+    for t in all_tasks:
+        t_payload = t.get("payload_json", {})
+        if isinstance(t_payload, str):
+            t_payload = json.loads(t_payload)
+        if t_payload.get("test_id") == current_rule_id:
+            same_rule_fingerprints.append(t["fp"])
+    
     ctx = VerifyContext(
         fp=fp,
-        rule_id=payload.get("test_id", "unknown"),
+        rule_id=current_rule_id,
         issue_number=task.get("issue_number"),
-        branch=f"cognition-project/{fp}",
+        branch=branch_name(fp),
         pr_number=pr_number,
         pr_head_sha=pr.get("head_sha", ""),
         pr_body=pr.get("body", ""),
         changed_files=changed_files,
         diff=diff,
-        repo_path=Path("."),  # Assumes running in repo root
-        known_fingerprints=[t["fp"] for t in db.list_tasks()],
+        repo_path=config.TARGET_REPO_PATH,
+        known_fingerprints=same_rule_fingerprints,
     )
     
     # Run verifier
@@ -479,7 +558,16 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         )
     
     # Handle verdict
-    if verdict.passed:
+    outcome = decide_outcome(verdict, task.get("attempt_count", 0))
+
+    if outcome == OUTCOME_WAIT:
+        logger.error(
+            f"Task {fp} verification could not complete (gate={verdict.gate}): "
+            f"{verdict.reason}. Staying in VERIFYING; will retry next tick."
+        )
+        return
+
+    if outcome == OUTCOME_READY:
         # Pass: label and post evidence
         if db.transition(fp, db.State.VERIFYING, db.State.READY):
             logger.info(f"Task {fp} -> READY (verification passed)")
@@ -499,35 +587,34 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
 - ACUs consumed: {session.get('acus_consumed', 0)}
 
 **Gates passed:** {', '.join(verdict.evidence.get('gates_passed', []))}
-"""
+{_skipped_gates_note(verdict)}"""
                 github_client.comment(issue.get("number"), evidence_comment)
-    else:
-        # Fail: retry or quarantine
+
+    elif outcome == OUTCOME_RETRY:
+        # Retry: message the same session
         attempt_count = task.get("attempt_count", 0)
-        
-        if attempt_count < config.MAX_ATTEMPTS and verdict.counts_as_attempt:
-            # Retry: message the same session
-            logger.info(f"Task {fp} retrying (attempt {attempt_count + 1}/{config.MAX_ATTEMPTS})")
-            
-            if db.transition(fp, db.State.VERIFYING, db.State.RUNNING):
-                db.increment_attempt_count(fp)
-                
-                # Send message to session with verbatim rejection
-                devin_client.send_message(
-                    session.get("session_id"),
-                    f"Verification failed:\n\n{verdict.reason}"
-                )
-        else:
-            # Quarantine
-            logger.warning(f"Task {fp} -> QUARANTINED (max attempts reached)")
-            
-            if db.transition(fp, db.State.VERIFYING, db.State.QUARANTINED):
-                if issue:
-                    # Label needs-human
-                    github_client.add_labels(issue.get("number"), ["needs-human"])
-                    
-                    # Post quarantine comment with diffs and rejections
-                    quarantine_comment = f"""## Task quarantined
+        logger.info(f"Task {fp} retrying (attempt {attempt_count + 1}/{config.MAX_ATTEMPTS})")
+
+        if db.transition(fp, db.State.VERIFYING, db.State.RUNNING):
+            db.increment_attempt_count(fp)
+
+            # Send message to session with verbatim rejection
+            devin_client.send_message(
+                session.get("session_id"),
+                f"Verification failed:\n\n{verdict.reason}"
+            )
+
+    else:
+        # Quarantine
+        logger.warning(f"Task {fp} -> QUARANTINED (max attempts reached)")
+
+        if db.transition(fp, db.State.VERIFYING, db.State.QUARANTINED):
+            if issue:
+                # Label needs-human
+                github_client.add_labels(issue.get("number"), ["needs-human"])
+
+                # Post quarantine comment with diffs and rejections
+                quarantine_comment = f"""## Task quarantined
 
 This task has reached the maximum number of attempts ({config.MAX_ATTEMPTS}) without passing verification.
 
@@ -537,7 +624,7 @@ This task has reached the maximum number of attempts ({config.MAX_ATTEMPTS}) wit
 
 The branch and PR are left open for forensic analysis.
 """
-                    github_client.comment(issue.get("number"), quarantine_comment)
+                github_client.comment(issue.get("number"), quarantine_comment)
 
 
 async def run_loop() -> None:
