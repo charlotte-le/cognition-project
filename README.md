@@ -2,15 +2,28 @@
 
 Devin does the work, the verifier decides whether it worked, a human decides whether it ships.
 
-## What this is
+## Quick Start
 
-cognition-project is a small service that runs one closed loop against a fork of `apache/superset`:
+```bash
+# 1. Configure environment
+cp .env.example .env
+# Edit .env with your Devin API credentials and GitHub token
+
+# 2. Start the service (Docker - recommended)
+docker compose up
+
+# 3. Access the status page
+open http://localhost:8000/status
+
+# 4. Trigger a scan
+curl -X POST http://localhost:8000/scan
+```
+
+## What This Is
+
+cognition-project is a service that runs one closed loop against a fork of `apache/superset`:
 
 **scan → file an issue → hand it to Devin → independently verify the resulting PR → either put it in front of a human, or send the evidence back to the same session for one repair attempt.**
-
-The load-bearing word is *independently*. Devin reports what it did. The verifier decides whether that report is true, using deterministic checks the agent cannot reach or influence.
-
-One container, one process, organized as a proper Python package, built in a day against the real Devin v3 API.
 
 ## Project Structure
 
@@ -82,52 +95,131 @@ cognition-project/
 
 ```
 PENDING ──► RUNNING ──► VERIFYING ──► READY ──► MERGED
-                │            │
-                ▼            ▼
-            BLOCKED     QUARANTINED
-       (agent asked    (two verified
-        a question)     rejections)
+                │            │               │
+                │            │               │
+                ▼            ▼               │
+            BLOCKED     QUARANTINED ◄───────┘
+                │            ▲
+                │            │ (retry failed)
+                └────────────┘
+                (resume)
 ```
 
-## Running the Service
+**Additional transitions:**
+- RUNNING → FAILED (session failed, timeout, or HALT signal)
+- BLOCKED → VERIFYING (if PR created while blocked)
+
+
+## Running the Workflow
 
 The service runs as a single container handling both the reconciler loop and web interface.
 
-### Prerequisites
+### Option 1: Docker (Recommended)
 
+**Prerequisites:**
 - Docker and Docker Compose installed
-- For live mode: Devin API credentials and GitHub token
+- Devin API credentials and GitHub token
+- Target repository checkout (e.g., `apache/superset` fork)
 
-### Configuration
-
-Copy `.env.example` to `.env` and configure:
+**Setup:**
 
 ```bash
+# 1. Configure environment
 cp .env.example .env
-```
+# Edit .env with your real credentials:
+# - DEVIN_API_KEY: Your Devin API key (service user with ManageOrgSessions)
+# - DEVIN_ORG_ID: Your Devin organization ID
+# - GITHUB_TOKEN: GitHub personal access token
+# - GITHUB_REPO: Target repository in format "owner/repo"
+# - DRY_RUN: Set to "false" for live mode
 
-Required environment variables:
+# 2. Configure target repository path
+# Edit docker-compose.yml to set TARGET_REPO_HOST_PATH to your superset checkout
+# Default: ../superset (relative to project directory)
 
-| Variable | Description |
-|----------|-------------|
-| `DEVIN_API_KEY` | Devin API key (service user with `ManageOrgSessions`) |
-| `DEVIN_ORG_ID` | Devin organization ID |
-| `GITHUB_TOKEN` | GitHub personal access token |
-| `GITHUB_REPO` | GitHub repository in format `owner/repo` |
-
-### Starting the Service
-
-```bash
+# 3. Start the service
 docker compose up
 ```
 
-The status page will be available at http://localhost:8000/status
+**Access the service:**
+- Status page: http://localhost:8000/status
+- Scan trigger: `curl -X POST http://localhost:8000/scan`
+- Webhook endpoint: `http://localhost:8000/webhook` (for GitHub integration)
 
-### Usage
+### Option 2: Local Development
 
-- **Trigger a scan**: POST to `/scan` endpoint to run Bandit against the target repository
-- **View status**: Visit `/status` for real-time task and fleet status
-- **Webhook integration**: Configure GitHub webhook to POST to `/webhook` for issue-driven processing
+**Prerequisites:**
+- Python 3.11+
+- Bandit 1.7.9 (`pip install bandit==1.7.9`)
+- Target repository checkout
+
+**Setup:**
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env with your credentials and set TARGET_REPO_PATH
+
+# 3. Run the service
+python main.py
+```
+
+**Access the service:**
+- Status page: http://localhost:8000/status
+- Scan trigger: `curl -X POST http://localhost:8000/scan`
+
+### Workflow Steps
+
+1. **Initial Scan**
+   - Visit http://localhost:8000/status
+   - Click "Scan Now" or use `curl -X POST http://localhost:8000/scan`
+   - Bandit scans the target repository for security issues
+   - Findings are synced to the database and GitHub issues are created
+
+2. **Automated Processing**
+   - The reconciler loop runs every 30 seconds (configurable via TICK_SECONDS)
+   - Open issues labeled `cognition-project:auto` are picked up
+   - Devin sessions are created to fix each finding
+   - Sessions run with ACU limits and time constraints
+
+3. **Verification**
+   - When a session completes with a PR, the verifier runs
+   - Five-gate verification checks: Join, Policy, Oracle, Tests, Publish
+   - If verification passes, the task moves to READY state
+   - If verification fails, the agent gets one repair attempt
+
+4. **Human Review**
+   - READY tasks are presented for human review
+   - Review the PR and merge if acceptable
+   - After merge, the task is marked MERGED and the issue closes
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DEVIN_API_BASE` | Devin API base URL | `https://api.devin.ai` |
+| `DEVIN_API_KEY` | Devin API key | `demo-key` |
+| `DEVIN_ORG_ID` | Devin organization ID | `demo-org` |
+| `GITHUB_TOKEN` | GitHub personal access token | `demo-token` |
+| `GITHUB_REPO` | Target repository | `owner/repo` |
+| `TARGET_REPO_PATH` | Path to target repo checkout | `/repo` |
+| `DRY_RUN` | Enable demo mode (no real API calls) | `true` |
+| `TICK_SECONDS` | Reconciler loop interval | `30` |
+| `MAX_CONCURRENT` | Max concurrent sessions | `3` |
+| `DAILY_ACU_CEILING` | Daily ACU spending limit | `100.0` |
+| `RUN_TESTS_GATE` | Enable test verification gate | `false` |
+
+### GitHub Webhook Integration (Optional)
+
+For faster response to issue events, configure a GitHub webhook:
+
+1. Go to your repository Settings → Webhooks
+2. Add webhook: `http://your-server:8000/webhook`
+3. Select events: Issues (or use "Send me everything")
+4. The webhook triggers an immediate reconciler tick on issue changes
 
 ## The Verifier
 
@@ -163,17 +255,6 @@ These metrics are defined but not built at n = 12. The current demo shows the da
 
 ## Development
 
-### Running Locally
-
-Install dependencies and run:
-
-```bash
-pip install -r requirements.txt
-python main.py
-```
-
-The application will start the reconciler loop and web server, with the status page available at http://localhost:8000/status
-
 ### Running Tests
 
 Run the test suite:
@@ -190,12 +271,38 @@ pytest tests/test_reconciler.py
 pytest tests/test_verifier.py
 ```
 
-### Running with Docker
+## Troubleshooting
 
-Build and run with Docker Compose:
+### Common Issues
 
-```bash
-docker compose up
-```
+**Database not found error**
+- Run a scan first to initialize the database: `curl -X POST http://localhost:8000/scan`
 
-The status page will be available at http://localhost:8000/status
+**Devin API connection failed**
+- Verify `DEVIN_API_KEY` and `DEVIN_ORG_ID` are set correctly in `.env`
+- Check that your API key has the `ManageOrgSessions` permission
+
+**GitHub webhook not triggering**
+- Ensure the webhook URL is accessible from GitHub (use ngrok or similar for local development)
+- Verify the webhook is configured for "Issues" events
+
+**Bandit scan returns no findings**
+- Check that `TARGET_REPO_PATH` points to a valid repository checkout
+- Verify `RULE_ALLOWLIST` includes the Bandit rule IDs you want to detect
+- Ensure the target repository contains Python code to scan
+
+**Verification gate fails with "infra" error**
+- This indicates an environment issue, not an agent failure
+- Check that Bandit is installed and accessible: `bandit --version`
+- Verify the target repository path is correct and accessible
+- If using the tests gate, ensure test dependencies are installed
+
+**Task stuck in BLOCKED state**
+- The agent asked a question and is waiting for human input
+- Visit the Devin session URL (shown in the status page) to respond
+- Or answer directly on the GitHub issue
+
+**HALT latched error**
+- The system received a HALT signal from the Devin platform
+- No new sessions will be created until the latch is cleared
+- Check the Devin platform for platform-wide issues or limits
