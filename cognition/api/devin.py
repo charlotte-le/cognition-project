@@ -121,7 +121,7 @@ class DevinClient:
         """
         Create a new Devin session.
         
-        Returns SessionResponse with fields: session_id, url, status, acus_consumed.
+        Returns SessionResponse with fields: session_id, url, status.
         IMPORTANT: structured_output and status_detail are never populated on create response.
         """
         if config.DRY_RUN:
@@ -136,7 +136,6 @@ class DevinClient:
                 "session_id": f"dry-run-{uuid.uuid4().hex}",
                 "url": "https://app.devin.ai/sessions/dry-run",
                 "status": "new",
-                "acus_consumed": 0,
             }
 
         body = {
@@ -163,14 +162,13 @@ class DevinClient:
             "session_id": response.get("session_id"),
             "url": response.get("url"),
             "status": response.get("status"),
-            "acus_consumed": response.get("acus_consumed"),
         }
     
     def list_tagged_sessions(self) -> List[Dict[str, Any]]:
         """
         List sessions tagged with cfg.SESSION_TAG.
         
-        Returns list of sessions with: session_id, status, status_detail, acus_consumed,
+        Returns list of sessions with: session_id, status, status_detail,
         pull_requests[{pr_url, pr_state}], structured_output, title, url.
         """
         response = self._request(
@@ -188,7 +186,6 @@ class DevinClient:
                     "session_id": session.get("session_id"),
                     "status": session.get("status"),
                     "status_detail": session.get("status_detail"),
-                    "acus_consumed": session.get("acus_consumed"),
                     "pull_requests": session.get("pull_requests", []),
                     "structured_output": session.get("structured_output"),
                     "title": session.get("title"),
@@ -201,7 +198,7 @@ class DevinClient:
         """
         Get a specific session by ID.
         
-        Returns session dict with: session_id, status, status_detail, acus_consumed,
+        Returns session dict with: session_id, status, status_detail,
         pull_requests[{pr_url, pr_state}], structured_output, title, url.
         Returns None if session not found.
         """
@@ -216,7 +213,6 @@ class DevinClient:
                 "session_id": response.get("session_id"),
                 "status": response.get("status"),
                 "status_detail": response.get("status_detail"),
-                "acus_consumed": response.get("acus_consumed"),
                 "pull_requests": response.get("pull_requests", []),
                 "structured_output": response.get("structured_output"),
                 "title": response.get("title"),

@@ -13,10 +13,6 @@ def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, default))
 
 
-def _env_float(name: str, default: float) -> float:
-    return float(os.environ.get(name, default))
-
-
 def _env_list(name: str, default: list) -> list:
     raw = os.environ.get(name)
     if not raw:
@@ -103,13 +99,37 @@ SESSION_TAG = os.environ.get("SESSION_TAG", "cognition-project")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "owner/repo")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
-# ACU configuration
+# Per-session spend cap, sent to the vendor as max_acu_limit and enforced on their
+# side. This is deliberately not paired with any local ACU accounting: the API
+# reports acus_consumed as 0.0 for every session, so anything we summed here would
+# be a guarantee we could not keep. Concurrency and wall clock are the local limits.
 MAX_ACU_PER_SESSION = _env_int("MAX_ACU_PER_SESSION", 12)
+
+# How often the scheduled scan re-runs Bandit against the target repo.
+#
+# This is the trigger that feeds the pipeline: without it the only way a finding
+# ever enters the ledger is someone pressing Scan Now. Set to 0 to disable the
+# schedule and keep the manual trigger only.
+#
+# Scanning is idempotent - findings are keyed by fingerprint and upsert_task only
+# reports a row as new on first insert - so a repeat scan files no duplicate
+# issues for findings the ledger already knows about.
+SCAN_INTERVAL_MINUTES = _env_int("SCAN_INTERVAL_MINUTES", 60)
+
+# What one of these findings costs a human, in minutes, end to end: read the
+# flagged call site, work out whether the interpolated value can reach it, write
+# the parameterized form, run the tests, open the PR. Used only to translate the
+# remediation count into hours on the status page.
+#
+# This is an assumption, not a measurement, so the page prints it next to the
+# number it produces. An operator with their own timing data should set this from
+# the environment; the point of the metric is the order of magnitude, and it is
+# worth more stated openly than left off the page because it cannot be derived.
+HUMAN_FIX_MINUTES = _env_int("HUMAN_FIX_MINUTES", 45)
 
 # Reconciler configuration
 TICK_SECONDS = _env_int("TICK_SECONDS", 30)
 MAX_CONCURRENT = _env_int("MAX_CONCURRENT", 3)
-DAILY_ACU_CEILING = _env_float("DAILY_ACU_CEILING", 100.0)
 WALL_CLOCK_MINUTES = _env_int("WALL_CLOCK_MINUTES", 45)
 MAX_ATTEMPTS = _env_int("MAX_ATTEMPTS", 2)
 

@@ -93,7 +93,6 @@ def can_admit(task: Dict[str, Any]) -> Tuple[bool, str]:
     Admission policy:
     - The class is in RULE_ALLOWLIST
     - db.count_active() < cfg.MAX_CONCURRENT
-    - db.acus_today() < cfg.DAILY_ACU_CEILING
     - No HALT is latched
     
     Returns:
@@ -112,12 +111,7 @@ def can_admit(task: Dict[str, Any]) -> Tuple[bool, str]:
     active_count = db.count_active()
     if active_count >= config.MAX_CONCURRENT:
         return False, f"Concurrency limit reached ({active_count}/{config.MAX_CONCURRENT})"
-    
-    # Check daily ACU ceiling
-    acus_today = db.acus_today()
-    if acus_today >= config.DAILY_ACU_CEILING:
-        return False, f"Daily ACU ceiling reached ({acus_today}/{config.DAILY_ACU_CEILING})"
-    
+
     return True, "Admitted"
 
 
@@ -147,6 +141,47 @@ def harvest_pr(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def resolve_session(
+    fp: str,
+    guess: Optional[Dict[str, Any]],
+    devin_client,
+    session_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the session this task's current attempt actually created.
+
+    The fp -> session map in tick() is built by parsing session titles, and a
+    title is not unique to a session: a retry reuses it, and a session outlives
+    the ledger row that spawned it, so a wiped or rebuilt ledger leaves corpses
+    still carrying a live fingerprint. The map keeps one entry per fingerprint,
+    so whichever session lands last wins - which is how a suspended corpse ends
+    up shadowing the session that is still working and holds the PR.
+
+    The attempt row is the only record of which session this attempt created, so
+    it is authoritative. Prefer the already-fetched insights list to answer by
+    id, and only spend an HTTP call when the session is not in it.
+    """
+    attempt = db.get_current_attempt(fp)
+    expected_session_id = (attempt or {}).get("session_id")
+
+    # No attempt row yet, or an attempt that never recorded a session: the
+    # title map is the only thing we have to go on.
+    if not expected_session_id:
+        return guess
+
+    if (guess or {}).get("session_id") == expected_session_id:
+        return guess
+
+    logger.info(
+        f"Task {fp} resolving session {expected_session_id} directly "
+        f"(insights gave {(guess or {}).get('session_id')})"
+    )
+
+    if session_by_id and expected_session_id in session_by_id:
+        return session_by_id[expected_session_id]
+
+    return devin_client.get_session(expected_session_id)
+
+
 def move_to_verifying(fp: str, task: Dict[str, Any], session: Dict[str, Any], from_state: str) -> None:
     """Harvest a session's PR and transition the task to VERIFYING.
 
@@ -165,10 +200,6 @@ def move_to_verifying(fp: str, task: Dict[str, Any], session: Dict[str, Any], fr
         logger.warning(f"Task {fp} session completed but no PR found")
         return
 
-    # Update ACUs and transition to VERIFYING
-    acus_consumed = session.get("acus_consumed", 0)
-    new_acus_total = task.get("acus_total", 0) + acus_consumed
-
     # Store structured_output in attempts table
     attempt_id = task.get("current_attempt_id")  # This should be set when session created
     if attempt_id:
@@ -176,13 +207,13 @@ def move_to_verifying(fp: str, task: Dict[str, Any], session: Dict[str, Any], fr
             attempt_id,
             session_id=session.get("session_id"),
             session_url=session.get("url"),
+            pr_url=pr_info.get("pr_url"),
             outcome="completed",
             claim_json=pr_info.get("structured_output"),
-            acus_consumed=acus_consumed,
             ended_at=datetime.utcnow().isoformat(),
         )
 
-    if db.transition(fp, from_state, db.State.VERIFYING, acus_total=new_acus_total):
+    if db.transition(fp, from_state, db.State.VERIFYING):
         logger.info(f"Task {fp} -> VERIFYING (session completed)")
 
 
@@ -223,8 +254,14 @@ async def tick() -> None:
     # Build session lookup by fingerprint
     # Session title format: [cognition-project] scan:<fp> att=<attempt_no> — <description>
     session_by_fp: Dict[str, Dict[str, Any]] = {}
+    # Titles are not unique per fingerprint, so session_by_fp is a guess that
+    # resolve_session checks against the attempt row. Keep an id-keyed index of
+    # the same payload so that check costs a dict lookup instead of an HTTP GET.
+    session_by_id: Dict[str, Dict[str, Any]] = {
+        s.get("session_id"): s for s in tagged_sessions if s.get("session_id")
+    }
     unrecognized_sessions: List[Dict[str, Any]] = []
-    
+
     for session in tagged_sessions:
         title = session.get("title", "")
         # Extract fingerprint from title
@@ -235,6 +272,15 @@ async def tick() -> None:
                 fp_part = [p for p in parts if p.startswith("scan:")]
                 if fp_part:
                     fp = fp_part[0]  # e.g., "scan:a91c3f2e"
+                    if fp in session_by_fp:
+                        # Harmless in itself - resolve_session settles it from the
+                        # attempt row - but worth saying out loud, because a
+                        # shadowed session is invisible in every other log line.
+                        logger.warning(
+                            f"Multiple tagged sessions claim {fp}: "
+                            f"{session_by_fp[fp].get('session_id')} and "
+                            f"{session.get('session_id')}; the attempt row decides"
+                        )
                     session_by_fp[fp] = session
             except Exception as e:
                 logger.warning(f"Failed to parse session title '{title}': {e}")
@@ -270,7 +316,15 @@ async def tick() -> None:
     # Reconcile each task
     for fp, task in task_by_fp.items():
         try:
-            await reconcile_task(fp, task, session_by_fp.get(fp), issue_by_fp.get(fp), github_client, devin_client)
+            await reconcile_task(
+                fp,
+                task,
+                session_by_fp.get(fp),
+                issue_by_fp.get(fp),
+                github_client,
+                devin_client,
+                session_by_id=session_by_id,
+            )
         except Exception as e:
             logger.error(f"Error reconciling task {fp}: {e}")
             _last_tick_exception = str(e)
@@ -282,21 +336,34 @@ async def reconcile_task(
     session: Optional[Dict[str, Any]],
     issue: Optional[Dict[str, Any]],
     github_client,
-    devin_client
+    devin_client,
+    session_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     """Reconcile a single task, taking at most one transition.
-    
+
     Args:
         fp: Task fingerprint.
         task: Task dictionary from the database.
-        session: Session dictionary from Devin API (if exists).
+        session: Session dictionary from Devin API (if exists), as guessed from
+            session titles - corrected here before any state reads it.
         issue: Issue dictionary from GitHub API (if exists).
         github_client: GitHub client instance.
         devin_client: Devin client instance.
+        session_by_id: All tagged sessions keyed by session_id, so the guess can
+            be corrected without an extra API call.
     """
     state = task.get("state", db.State.PENDING)
     attempt_count = task.get("attempt_count", 0)
-    
+
+    # Correct the title-derived guess once, here, rather than in each branch that
+    # happens to remember to. Every state below reads the session to decide
+    # whether work finished, so a branch that skips this silently reconciles the
+    # wrong session: BLOCKED read a corpse's empty pull_requests[] and parked a
+    # task that had already opened its PR, and the VERIFYING retry path posted
+    # its rejection into a dead session the agent would never read.
+    if state != db.State.PENDING:
+        session = resolve_session(fp, session, devin_client, session_by_id)
+
     # PENDING -> RUNNING: create session if policy admits
     if state == db.State.PENDING:
         admitted, reason = can_admit(task)
@@ -308,19 +375,9 @@ async def reconcile_task(
     # RUNNING: normalize and transition based on session state
     elif state == db.State.RUNNING:
         if not session:
-            # Fallback: try to get session directly by ID if insights list was incomplete
-            current_attempt = db.get_current_attempt(fp)
-            if current_attempt and current_attempt.get("session_id"):
-                session_id = current_attempt.get("session_id")
-                logger.info(f"Task {fp} not in insights list, fetching session {session_id} directly")
-                session = devin_client.get_session(session_id)
-                if not session:
-                    logger.warning(f"Task {fp} is RUNNING but session {session_id} not found")
-                    return
-            else:
-                logger.warning(f"Task {fp} is RUNNING but has no session")
-                return
-        
+            logger.warning(f"Task {fp} is RUNNING but has no session")
+            return
+
         normalized = devin.normalize(session.get("status"), session.get("status_detail"))
         
         # Check wall clock. Measured from when the attempt started, not from
@@ -330,15 +387,37 @@ async def reconcile_task(
         started_at = (attempt or {}).get("started_at") or task.get("updated_at")
         wall_clock_minutes = (datetime.utcnow() - datetime.fromisoformat(started_at)).total_seconds() / 60
         if wall_clock_minutes > config.WALL_CLOCK_MINUTES:
+            # A session that already produced a PR has done the work, however
+            # long it took. Harvest it before the clock throws it away: this
+            # check used to run first and discarded finished PRs outright
+            # whenever the reconciler had been down longer than the limit.
+            if harvest_pr(session):
+                logger.info(
+                    f"Task {fp} exceeded wall clock ({wall_clock_minutes:.1f}m) but has a "
+                    f"PR; verifying it rather than discarding the work"
+                )
+                move_to_verifying(fp, task, session, db.State.RUNNING)
+                return
+
+            # "<cause>: <detail>" - the status page badges the cause and puts
+            # the detail in the body text beneath it.
+            reason = (
+                f"Wall clock exceeded: no PR after {wall_clock_minutes:.0f}m "
+                f"(limit {config.WALL_CLOCK_MINUTES}m); session {session.get('status')}"
+                f"/{session.get('status_detail')}"
+            )
             logger.warning(f"Task {fp} wall clock exceeded ({wall_clock_minutes:.1f}m > {config.WALL_CLOCK_MINUTES}m)")
-            if db.transition(fp, db.State.RUNNING, db.State.FAILED):
-                logger.info(f"Task {fp} -> FAILED (wall clock exceeded)")
+            if db.transition(fp, db.State.RUNNING, db.State.FAILED, failure_reason=reason):
+                logger.info(f"Task {fp} -> FAILED ({reason})")
             return
-        
+
         # RUNNING -> BLOCKED: agent asked a question
         if normalized == devin.Internal.BLOCKED:
             if db.transition(fp, db.State.RUNNING, db.State.BLOCKED):
                 logger.info(f"Task {fp} -> BLOCKED (agent asked question)")
+                # The task may well go on to pass every gate, but it did not get
+                # there unattended. Latch that here, while we know it.
+                db.mark_human_touched(fp)
                 # Comment on issue with agent's question and session link
                 if issue:
                     question = session.get("status_detail", "Agent is waiting for user input")
@@ -352,8 +431,12 @@ async def reconcile_task(
         
         # RUNNING -> FAILED: session failed
         elif normalized == devin.Internal.FAILED:
-            if db.transition(fp, db.State.RUNNING, db.State.FAILED):
-                logger.info(f"Task {fp} -> FAILED (session failed)")
+            reason = (
+                f"Session ended without a PR: "
+                f"{session.get('status')}/{session.get('status_detail')}"
+            )
+            if db.transition(fp, db.State.RUNNING, db.State.FAILED, failure_reason=reason):
+                logger.info(f"Task {fp} -> FAILED ({reason})")
         
         # RUNNING -> HALT: HALT signal from platform
         elif normalized == devin.Internal.HALT:
@@ -367,30 +450,66 @@ async def reconcile_task(
     elif state == db.State.VERIFYING:
         await run_verification(fp, task, session, issue, github_client, devin_client)
     
-    # READY: check if PR is merged
+    # READY: the change is verified and waiting on a human. Either they merge it
+    # or they close it; both are terminal, and until this handled "closed" a
+    # declined PR sat in READY forever looking like it was still under review.
+    #
+    # Asked of GitHub, not of the session: whether a PR merged is GitHub's fact,
+    # and reading it here means a task still resolves when the session has been
+    # suspended, untagged, or dropped from the insights list.
     elif state == db.State.READY:
-        if not session:
-            logger.warning(f"Task {fp} is READY but has no session")
+        try:
+            pr = github_client.find_pr_for_branch(scanner.branch_name(fp))
+        except Exception as e:
+            logger.error(f"Task {fp} is READY but its PR could not be read: {e}")
             return
-        
-        pr_info = harvest_pr(session)
-        if pr_info and pr_info.get("pr_state") == "merged":
+
+        if not pr:
+            logger.warning(f"Task {fp} is READY but has no PR on {config.GITHUB_REPO}")
+            return
+
+        if pr.get("merged"):
             if db.transition(fp, db.State.READY, db.State.MERGED):
-                logger.info(f"Task {fp} -> MERGED")
+                logger.info(f"Task {fp} -> MERGED (PR #{pr.get('number')})")
                 if issue:
                     github_client.close_issue(issue.get("number"))
+
+        elif pr.get("state") == "closed":
+            reason = (
+                f"PR closed without merging: "
+                f"#{pr.get('number')} was closed by a reviewer, finding still open"
+            )
+            if db.transition(fp, db.State.READY, db.State.CLOSED, failure_reason=reason):
+                logger.info(f"Task {fp} -> CLOSED ({reason})")
+                if issue:
+                    github_client.add_labels(issue.get("number"), ["needs-human"])
+                    github_client.comment(
+                        issue.get("number"),
+                        f"## PR closed without merging\n\n"
+                        f"The change passed verification, but PR #{pr.get('number')} was "
+                        f"closed rather than merged. The finding is still open.\n\n"
+                        f"Reopening this issue for a fresh attempt is a human decision, "
+                        f"so the task has been left in a terminal state.",
+                    )
     
     # BLOCKED: can be resumed if session becomes RUNNING again, or the PR may have
     # already been merged/acted on directly on GitHub while the session sat waiting
     elif state == db.State.BLOCKED:
-        if session:
-            if harvest_pr(session):
-                move_to_verifying(fp, task, session, db.State.BLOCKED)
-            else:
-                normalized = devin.normalize(session.get("status"), session.get("status_detail"))
-                if normalized == Internal.RUNNING:
-                    if db.transition(fp, db.State.BLOCKED, db.State.RUNNING):
-                        logger.info(f"Task {fp} -> RUNNING (resumed)")
+        if not session:
+            # BLOCKED is not terminal, so a task that can no longer see its
+            # session is stuck rather than finished. Say so: this used to be a
+            # bare `if session:` with no else, and the only symptom of a task
+            # parked here forever was the absence of any log line about it.
+            logger.warning(f"Task {fp} is BLOCKED but has no session")
+            return
+
+        if harvest_pr(session):
+            move_to_verifying(fp, task, session, db.State.BLOCKED)
+        else:
+            normalized = devin.normalize(session.get("status"), session.get("status_detail"))
+            if normalized == devin.Internal.RUNNING:
+                if db.transition(fp, db.State.BLOCKED, db.State.RUNNING):
+                    logger.info(f"Task {fp} -> RUNNING (resumed)")
 
 
 async def create_session(fp: str, task: Dict[str, Any], devin_client) -> None:
@@ -467,34 +586,34 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         logger.warning(f"Task {fp} is VERIFYING but has no session")
         return
     
-    pr_info = harvest_pr(session)
-    if not pr_info:
-        logger.warning(f"Task {fp} is VERIFYING but has no PR")
-        return
-    
-    # Get PR details
-    pr_url = pr_info.get("pr_url")
-    if not pr_url:
-        logger.warning(f"Task {fp} has no PR URL")
-        return
-    
-    # Extract PR number from URL
-    try:
-        pr_number = int(pr_url.split("/")[-1])
-    except (ValueError, IndexError):
-        logger.error(f"Failed to parse PR number from URL: {pr_url}")
-        return
-    
-    # Get PR details from GitHub
+    # Resolve the PR from GitHub rather than from the session. The branch is
+    # enough to find it, and a suspended or untagged session stops reporting
+    # pull_requests[] entirely - which used to abandon verification outright.
     try:
         pr = github_client.find_pr_for_branch(scanner.branch_name(fp))
-        if not pr:
-            logger.warning(f"PR not found for task {fp}")
-            return
     except Exception as e:
         logger.error(f"Failed to fetch PR for task {fp}: {e}")
         return
-    
+
+    if not pr:
+        logger.warning(f"Task {fp} is VERIFYING but has no PR on {config.GITHUB_REPO}")
+        return
+
+    pr_number = pr.get("number")
+    if not pr_number:
+        logger.warning(f"Task {fp} has a PR with no number")
+        return
+
+    pr_url = f"https://github.com/{config.GITHUB_REPO}/pull/{pr_number}"
+
+    # Record the PR on the attempt so the status page can link it.
+    # move_to_verifying only writes this on the RUNNING -> VERIFYING edge, so a
+    # task that arrived here any other way would never get a link.
+    attempt_id = task.get("current_attempt_id")
+    if attempt_id:
+        db.finish_attempt(attempt_id, pr_url=pr_url)
+
+
     # Get diff and changed files
     try:
         diff = github_client.get_pr_diff(pr_number)
@@ -509,18 +628,35 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         import json
         payload = json.loads(payload)
     
-    # Get known fingerprints for the same rule only - comparing across rules
-    # causes false positives when the scanner filters by RULE_ALLOWLIST
+    # Everything the ledger already knows about, as the baseline the oracle gate
+    # measures "new" against. Restricted to the same rule: comparing across rules
+    # causes false positives when the scanner filters by RULE_ALLOWLIST.
+    #
+    # Keyed by scanner.finding_key rather than by fingerprint so that a finding
+    # still matches its ledger row after it has shifted down its file.
     current_rule_id = payload.get("test_id", "unknown")
     all_tasks = db.list_tasks()
-    same_rule_fingerprints = []
+    same_rule_keys = []
     for t in all_tasks:
         t_payload = t.get("payload_json", {})
         if isinstance(t_payload, str):
             t_payload = json.loads(t_payload)
         if t_payload.get("test_id") == current_rule_id:
-            same_rule_fingerprints.append(t["fp"])
-    
+            same_rule_keys.append(
+                scanner.finding_key(
+                    t_payload.get("test_id", ""),
+                    t_payload.get("file_path", ""),
+                    t_payload.get("code", ""),
+                )
+            )
+
+    target_key = scanner.finding_key(
+        payload.get("test_id", ""),
+        payload.get("file_path", ""),
+        payload.get("code", ""),
+    )
+
+
     ctx = verifier.VerifyContext(
         fp=fp,
         rule_id=current_rule_id,
@@ -532,7 +668,8 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         changed_files=changed_files,
         diff=diff,
         repo_path=config.TARGET_REPO_PATH,
-        known_fingerprints=same_rule_fingerprints,
+        target_key=target_key,
+        known_finding_keys=same_rule_keys,
     )
     
     # Run verifier
@@ -542,8 +679,7 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         logger.error(f"Verification failed for task {fp}: {e}")
         return
     
-    # Update attempt with verdict
-    attempt_id = task.get("current_attempt_id")
+    # Update attempt with verdict (attempt_id resolved above)
     if attempt_id:
         db.finish_attempt(
             attempt_id,
@@ -580,7 +716,6 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
 **Evidence:**
 - Diff stats: {verdict.evidence.get('diff_added_lines', 0)}+ {verdict.evidence.get('diff_removed_lines', 0)}-
 - Session: {session.get('url')}
-- ACUs consumed: {session.get('acus_consumed', 0)}
 
 **Gates passed:** {', '.join(verdict.evidence.get('gates_passed', []))}
 {_skipped_gates_note(verdict)}"""
@@ -589,10 +724,28 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
     elif outcome == OUTCOME_RETRY:
         # Retry: message the same session
         attempt_count = task.get("attempt_count", 0)
-        logger.info(f"Task {fp} retrying (attempt {attempt_count + 1}/{config.MAX_ATTEMPTS})")
+        next_attempt_no = attempt_count + 1
+        logger.info(f"Task {fp} retrying (attempt {next_attempt_no}/{config.MAX_ATTEMPTS})")
 
         if db.transition(fp, db.State.VERIFYING, db.State.RUNNING):
             db.increment_attempt_count(fp)
+
+            # Open a fresh attempt row before resuming the session. The retry
+            # runs in the same Devin session, but it is a distinct attempt with
+            # its own claim and its own verdict: reusing the row let the second
+            # finish_attempt overwrite the rejection that caused the retry, so
+            # the repair loop left no trace and first-pass yield was
+            # unmeasurable. Carry the session over - the work continues where it
+            # left off, only the accounting is new.
+            retry_attempt_id = db.start_attempt(fp, next_attempt_no, str(uuid.uuid4()))
+            db.finish_attempt(
+                retry_attempt_id,
+                session_id=session.get("session_id"),
+                session_url=session.get("url"),
+            )
+            db.transition(
+                fp, db.State.RUNNING, db.State.RUNNING, current_attempt_id=retry_attempt_id
+            )
 
             # Send message to session with verbatim rejection
             devin_client.send_message(
@@ -605,6 +758,9 @@ async def run_verification(fp: str, task: Dict[str, Any], session: Optional[Dict
         logger.warning(f"Task {fp} -> QUARANTINED (max attempts reached)")
 
         if db.transition(fp, db.State.VERIFYING, db.State.QUARANTINED):
+            # The harness spent its attempts and is handing the task to a person.
+            db.mark_human_touched(fp)
+
             if issue:
                 # Label needs-human
                 github_client.add_labels(issue.get("number"), ["needs-human"])

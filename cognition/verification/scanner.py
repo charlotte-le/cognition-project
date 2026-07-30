@@ -5,13 +5,41 @@ This module runs Bandit scans, fingerprints findings, and syncs them to the ledg
 
 import hashlib
 import json
+import logging
+import re
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from cognition.core import config, db
 from cognition.api import github
+
+logger = logging.getLogger(__name__)
+
+
+# Liveness for the scheduled scan, mirroring the reconciler's tick globals.
+# Without these the status page can say the reconciler is alive while the trigger
+# that feeds it has been dead for hours.
+_last_scan_time: Optional[datetime] = None
+_last_scan_findings: Optional[int] = None
+_last_scan_error: Optional[str] = None
+
+
+def get_last_scan_time() -> Optional[datetime]:
+    """When the last scan completed, or None if none has run this process."""
+    return _last_scan_time
+
+
+def get_last_scan_findings() -> Optional[int]:
+    """How many allowlisted findings the last scan returned."""
+    return _last_scan_findings
+
+
+def get_last_scan_error() -> Optional[str]:
+    """Why the last scan failed, or None if it succeeded."""
+    return _last_scan_error
 
 
 @dataclass
@@ -25,12 +53,55 @@ class Finding:
     severity: str
 
 
+# Bandit renders a finding's `code` as one "<line_no> <source line>" per line of
+# the finding's range. Those numbers are part of the string, so anything that
+# shifts the finding down the file changes the text without changing the code.
+_BANDIT_LINE_PREFIX = re.compile(r"^\s*\d+\s")
+
+
+def normalize_code(code: str) -> str:
+    """Strip Bandit's line-number prefixes from a finding's code snippet.
+
+    This is what makes a finding's identity survive an edit above it. Hashing
+    Bandit's `code` verbatim ties the identity to the finding's position in the
+    file, so a fix that adds a line renames every finding below it and an
+    upstream merge renames findings nobody touched.
+
+    Args:
+        code: The `code` field from Bandit's JSON output.
+
+    Returns:
+        The same snippet with the line numbers removed.
+    """
+    return "\n".join(
+        _BANDIT_LINE_PREFIX.sub("", line) for line in code.splitlines()
+    ).strip()
+
+
+def finding_key(rule_id: str, path: str, code: str) -> str:
+    """Position-independent identity for a finding.
+
+    Two findings share a key when they are the same rule firing on the same
+    source text in the same file, regardless of what line it currently sits on.
+    This is the only sound basis for asking "is this finding new?" - see
+    verifier._gate_oracle.
+
+    Distinct from fingerprint(): fingerprints are the ledger's durable primary
+    key and are already embedded in filed GitHub issues and branch names, so
+    they cannot be redefined without migrating those. Keys are computed fresh on
+    every comparison and are never persisted.
+    """
+    return f"{rule_id}|{path.replace(chr(92), '/')}|{normalize_code(code)}"
+
+
 def fingerprint(rule_id: str, path: str, code: str) -> str:
     """Generate a fingerprint for a finding.
-    
-    Line numbers are deliberately excluded so that an unrelated edit fifty lines above 
-    does not mint a new "problem."
-    
+
+    Note: `code` carries Bandit's line-number prefixes, so this value moves when
+    the finding moves. That is tolerable for a ledger primary key, which only has
+    to be stable for as long as the row is open, but it is not a safe basis for
+    comparing two scans - use finding_key() for that.
+
     Args:
         rule_id: The Bandit test ID (e.g., "B608").
         path: The normalized file path.
@@ -180,21 +251,46 @@ def sync_findings(findings: List[Finding]) -> None:
             # Update the task with the issue number
             db.transition(fp, db.State.PENDING, db.State.PENDING, issue_number=issue_number)
 
+
+def run_scan(repo_path: Optional[Path] = None) -> int:
+    """Scan the target repo and sync what it finds, recording liveness.
+
+    This is the single entry point behind every scan trigger - the schedule, the
+    Scan Now button, and the CLI - so all three record the same liveness and
+    cannot drift apart.
+
+    Blocking: it shells out to Bandit and talks to the GitHub API. Async callers
+    must run it in a thread so the reconciler and the web server keep serving.
+
+    Args:
+        repo_path: Repo to scan. Defaults to config.TARGET_REPO_PATH.
+
+    Returns:
+        The number of allowlisted findings the scan returned.
+    """
+    global _last_scan_time, _last_scan_findings, _last_scan_error
+
+    target = repo_path if repo_path is not None else config.TARGET_REPO_PATH
+
+    try:
+        findings = scan(target)
+        sync_findings(findings)
+    except Exception as e:
+        # Recorded rather than swallowed: a scan that cannot run means the
+        # pipeline is starving, and that has to be visible on the status page.
+        _last_scan_time = datetime.utcnow()
+        _last_scan_error = str(e)
+        raise
+
+    _last_scan_time = datetime.utcnow()
+    _last_scan_findings = len(findings)
+    _last_scan_error = None
+    return len(findings)
+
+
 if __name__ == "__main__":
-    import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-    log = logging.getLogger(__name__)
 
-    cfg = config.cfg
-    repo_path = cfg.SUPERSET_PATH  # or wherever your fork is cloned
-
-    log.info("Starting scan of %s", repo_path)
-    findings = scan(repo_path)
-    log.info("Found %d findings after allowlist filter", len(findings))
-
-    for f in findings:
-        fp = fingerprint(f.test_id, f.file_path, f.code)
-        log.info("  %s  %s  %s:%d", fp, f.test_id, f.file_path, f.line_number)
-
-    sync_findings(findings)
-    log.info("Sync complete")
+    logger.info("Starting scan of %s", config.TARGET_REPO_PATH)
+    count = run_scan()
+    logger.info("Sync complete: %d findings after allowlist filter", count)

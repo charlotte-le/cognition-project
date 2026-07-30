@@ -43,7 +43,13 @@ class VerifyContext:
     changed_files: List[str]
     diff: str
     repo_path: Path
-    known_fingerprints: List[str] = field(default_factory=list)
+    # Position-independent keys (scanner.finding_key) for the finding under
+    # repair and for everything the ledger already knows about. The oracle gate
+    # compares on these rather than on fingerprints, which move when a finding
+    # moves. Both default to empty so a context built without them still gets a
+    # verdict, falling back to the fingerprint for the target check.
+    target_key: str = ""
+    known_finding_keys: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -479,12 +485,29 @@ def _gate_oracle(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
         for finding in findings
     }
 
+    # Position-independent identity, keyed to the finding it came from so a
+    # rejection can name the file and line a human has to go look at.
+    head_by_key = {
+        scanner.finding_key(
+            finding.get("test_id", ""),
+            finding.get("filename", ""),
+            finding.get("code", ""),
+        ): finding
+        for finding in findings
+    }
+
     evidence["bandit_fingerprints_after"] = list(current_fingerprints)
     evidence["bandit_finding_count"] = len(findings)
     evidence["bandit_total_findings_unfiltered"] = len(bandit_output.get("results", []))
 
-    # The fingerprint this task was opened for must be gone.
-    if ctx.fp in current_fingerprints:
+    # The finding this task was opened for must be gone. Matched on the
+    # position-independent key: a fingerprint match also clears when the finding
+    # merely moved, which would pass a PR that fixed nothing.
+    if ctx.target_key:
+        still_present = ctx.target_key in head_by_key
+    else:
+        still_present = ctx.fp in current_fingerprints
+    if still_present:
         return Verdict(
             passed=False,
             gate="oracle",
@@ -493,16 +516,45 @@ def _gate_oracle(ctx: VerifyContext, evidence: Dict[str, Any]) -> Verdict:
             counts_as_attempt=True,
         )
 
-    # Any fingerprint that isn't already known to the ledger is a new finding
-    # introduced by this change.
-    baseline = set(ctx.known_fingerprints) | {ctx.fp}
-    new_fingerprints = current_fingerprints - baseline
-    if new_fingerprints:
-        evidence["bandit_new_fingerprints"] = sorted(new_fingerprints)
+    # What counts as "introduced by this change".
+    #
+    # Two things this deliberately does not treat as new:
+    #
+    # 1. Findings in files the PR never touched. Bandit is per-file static
+    #    analysis, so a diff cannot create a finding in a file it did not edit.
+    #    Anything else there came from master. The ledger is a lagging snapshot -
+    #    the scanner refreshes it on its own schedule - so between scans every
+    #    finding on master the scanner had not filed yet looked like this PR's
+    #    fault.
+    # 2. Findings whose code is unchanged and only moved. Comparing fingerprints
+    #    made every line shift a new finding, which is why the attempts that did
+    #    pass had to contort the fix to be line-count neutral.
+    baseline_keys = set(ctx.known_finding_keys)
+    if ctx.target_key:
+        baseline_keys.add(ctx.target_key)
+    changed_files = set(ctx.changed_files)
+
+    new_findings = {
+        key: finding
+        for key, finding in head_by_key.items()
+        if key not in baseline_keys and finding.get("filename", "") in changed_files
+    }
+
+    evidence["oracle_baseline_known_keys"] = len(baseline_keys)
+    evidence["oracle_changed_files_considered"] = sorted(changed_files)
+
+    if new_findings:
+        located = sorted(
+            f"{f.get('test_id', '?')} {f.get('filename', '?')}:{f.get('line_number', '?')}"
+            for f in new_findings.values()
+        )
+        # Locations, not fingerprints: the fingerprint of a finding this PR
+        # just created is a number nobody can look up anywhere.
+        evidence["oracle_new_findings"] = located
         return Verdict(
             passed=False,
             gate="oracle",
-            reason=f"Fix introduced {len(new_fingerprints)} new finding(s): {', '.join(sorted(new_fingerprints))}",
+            reason=f"Fix introduced {len(new_findings)} new finding(s): {', '.join(located)}",
             evidence=evidence,
             counts_as_attempt=True,
         )

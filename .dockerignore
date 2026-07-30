@@ -1,0 +1,29 @@
+# Secrets. docker-compose reads .env from the host at run time via env_file,
+# so excluding it here costs nothing and keeps live credentials out of the
+# image layers — where `docker history` would expose them to anyone the image
+# is ever pushed or shared to.
+.env
+.env.*
+!.env.example
+
+# Local state. The database lives on the cognition-data volume at /data;
+# a copy baked into the image would shadow nothing but ship stale task rows.
+data/
+cognition/core/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build/tooling noise. Also keeps the build context small enough that a
+# rebuild does not re-upload the git history on every code change.
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.DS_Store
+
+# Editor and agent config, local to this machine.
+.claude/
+.devin/

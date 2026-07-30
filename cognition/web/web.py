@@ -7,6 +7,7 @@ FastAPI with four routes:
 - GET /metrics.json — programmatic access to metrics (parseable JSON)
 """
 
+import asyncio
 import sqlite3
 import os
 import json
@@ -17,14 +18,25 @@ from typing import Optional
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from cognition.core import config, db
+from cognition.core import config, db, reconciler
 from cognition.verification import scanner
 
 app = FastAPI(title="cognition-project")
 
 
-# Global flag for immediate tick
-_webhook_received = False
+# Set by POST /webhook, awaited by the reconciler loop.
+#
+# An Event rather than a bool because the loop has to be able to *block* on it.
+# The bool version was read once at the top of each iteration, after the full
+# TICK_SECONDS sleep had already elapsed, so a delivery never bought back any
+# latency - it only logged a line. The loop now sleeps on this Event with the
+# tick interval as a timeout, so a delivery wakes it immediately.
+#
+# Built on first use inside the running loop rather than at import: before
+# Python 3.10 an Event binds to whichever loop exists when it is constructed,
+# and at import time that is either the wrong loop or no loop at all.
+_webhook_event: Optional[asyncio.Event] = None
+_webhook_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 # Roughly three lines of claim text at the Claim → Verdict column width and type
@@ -54,6 +66,26 @@ def _count(n: int, label: str) -> str:
     return f'<span class="zero">{n}</span> {escape(label)}'
 
 
+def _ago(when: Optional[datetime], never: str = "never") -> str:
+    """Render a timestamp as "15s ago" / "4m ago", or `never` if there is none.
+
+    The liveness globals are written with utcnow() and so are naive; anything
+    naive is read as UTC rather than as local time, which is what kept the
+    "last tick" reading sane across a container in one zone and a browser in
+    another.
+    """
+    if when is None:
+        return never
+
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+
+    seconds_ago = (datetime.now(timezone.utc) - when).total_seconds()
+    if seconds_ago < 60:
+        return f"{int(seconds_ago)}s ago"
+    return f"{int(seconds_ago / 60)}m ago"
+
+
 def _stat(value: str, label: str, is_zero: bool = False) -> str:
     """One tile in the headline stat strip: big value over a small caps label."""
     cls = "stat is-zero" if is_zero else "stat"
@@ -63,6 +95,149 @@ def _stat(value: str, label: str, is_zero: bool = False) -> str:
         f'<div class="stat-label">{escape(label)}</div>'
         f"</div>"
     )
+
+
+# A task is counted for autonomy once it has an outcome to judge, or has stopped
+# to wait for a person. PENDING/RUNNING/VERIFYING are still in flight and say
+# nothing yet, so they stay out of the denominator rather than dragging the rate
+# down for the crime of being recent.
+_RESOLVED_STATES = ("READY", "MERGED", "CLOSED", "QUARANTINED", "FAILED", "BLOCKED")
+
+# Of those, the ones the machine delivered all the way to the review gate. CLOSED
+# belongs here: the reviewer declined the change, but the system still got it in
+# front of them unattended, which is what this metric asks. Whether reviewers say
+# yes is a different question, and conflating the two would let a good pipeline
+# with a picky reviewer read as a system that cannot work on its own.
+_DELIVERED_STATES = ("READY", "MERGED", "CLOSED")
+
+
+def _avg_discovery_to_review_minutes(conn: sqlite3.Connection) -> Optional[float]:
+    """Mean minutes from discovery to a PR a human can review.
+
+    Discovery is the moment the first session on a finding started, not the
+    moment the scanner wrote the row. The gap between those two is queue depth -
+    how long the backlog was when the finding landed - and folding it in makes
+    the pipeline look slow on a busy day and fast on a quiet one without
+    anything about the pipeline having changed. Anchoring on the session start
+    measures the part this system actually controls.
+
+    The clock stops when the verifier passes the change, because that is when
+    the PR gets its ready-for-review label and a person can pick it up. Time it
+    then spends waiting on a reviewer is the reviewer's queue, not throughput.
+
+    MIN(started_at) rather than the passing attempt's own start: when a task
+    needed three sessions to land, the wait for review really was all three.
+    Timing only the last one would make the repair loop look free, and reward
+    a change that fails twice over one that lands first time.
+
+    Shared by the status page and /metrics.json so the two cannot disagree.
+    """
+    row = conn.execute(
+        """
+        SELECT AVG((julianday(passed.ended_at) - julianday(first.started_at))
+                   * 24 * 60) AS avg_minutes
+        FROM attempts passed
+        JOIN (
+            SELECT fp, MIN(started_at) AS started_at FROM attempts GROUP BY fp
+        ) first ON first.fp = passed.fp
+        WHERE passed.verdict_passed = 1 AND passed.ended_at IS NOT NULL
+        """
+    ).fetchone()
+    return row["avg_minutes"] if row and row["avg_minutes"] else None
+
+
+def _outcome_metrics(conn: sqlite3.Connection) -> dict:
+    """Compute the three metrics an engineering leader actually asks for.
+
+    Autonomy rate  - did the machine get there without us?
+    First-pass yield - was it right the first time, or did it need the repair loop?
+    Hours returned - what was that worth?
+
+    Shared by the status page and /metrics.json so the two cannot disagree about
+    the same question.
+    """
+    resolved_ph = ",".join("?" * len(_RESOLVED_STATES))
+    delivered_ph = ",".join("?" * len(_DELIVERED_STATES))
+
+    # AUTONOMY: reached the review gate with no human pulled in along the way.
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS resolved,
+            COUNT(CASE WHEN state IN ({delivered_ph}) AND human_touched = 0
+                       THEN 1 END) AS autonomous,
+            COUNT(CASE WHEN human_touched = 1 THEN 1 END) AS interrupted
+        FROM tasks
+        WHERE state IN ({resolved_ph})
+        """,
+        (*_DELIVERED_STATES, *_RESOLVED_STATES),
+    ).fetchone()
+    resolved = row["resolved"] or 0
+    autonomous = row["autonomous"] or 0
+    interrupted = row["interrupted"] or 0
+
+    # FIRST-PASS YIELD: passed on attempt 1, out of every task the verifier ever
+    # returned a verdict on. Counted over tasks rather than attempts - a task
+    # that failed twice is one task that did not land first time, not two.
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(DISTINCT fp) AS judged,
+            COUNT(DISTINCT CASE WHEN attempt_no = 1 AND verdict_passed = 1
+                                THEN fp END) AS first_pass
+        FROM attempts
+        WHERE verdict_passed IS NOT NULL
+        """
+    ).fetchone()
+    judged = row["judged"] or 0
+    first_pass = row["first_pass"] or 0
+
+    # HOURS RETURNED: verified work the team did not have to do. READY counts -
+    # the fix exists and is waiting on a merge button, and the engineering time
+    # it replaces was already spent by the agent. The assumption behind the
+    # multiplier is printed next to the number.
+    row = conn.execute(
+        f"SELECT COUNT(*) AS remediated FROM tasks WHERE state IN ({delivered_ph})",
+        _DELIVERED_STATES,
+    ).fetchone()
+    # CLOSED is delivered but not remediated - the finding is still open, so it
+    # buys back nothing. Subtract it back out rather than widening the tuple.
+    closed = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE state = 'CLOSED'"
+    ).fetchone()["n"] or 0
+    remediated = (row["remediated"] or 0) - closed
+    hours_returned = remediated * config.HUMAN_FIX_MINUTES / 60
+
+    return {
+        "autonomy": {
+            "rate": (autonomous / resolved) if resolved else None,
+            "autonomous": autonomous,
+            "resolved": resolved,
+            "interrupted": interrupted,
+        },
+        "first_pass": {
+            "rate": (first_pass / judged) if judged else None,
+            "first_pass": first_pass,
+            "judged": judged,
+        },
+        "hours_returned": {
+            "hours": hours_returned,
+            "remediated": remediated,
+            "assumed_minutes_per_fix": config.HUMAN_FIX_MINUTES,
+        },
+    }
+
+
+def _pct(rate: Optional[float]) -> str:
+    """Render a rate as a percentage, or an em-dash when there is nothing to rate."""
+    return f"{rate * 100:.0f}%" if rate is not None else "—"
+
+
+def _hours(hours: float) -> str:
+    """Hours at one decimal until they get big enough that the decimal is noise."""
+    if not hours:
+        return "0h"
+    return f"{hours:.1f}h" if hours < 10 else f"{hours:.0f}h"
 
 
 @app.post("/webhook")
@@ -77,8 +252,7 @@ async def webhook(request: Request) -> Response:
     the system faster, not more correct. If it breaks entirely, the 30-second tick
     catches everything anyway.
     """
-    global _webhook_received
-    _webhook_received = True
+    webhook_signal().set()
     return Response(status_code=200)
 
 
@@ -126,23 +300,14 @@ async def status() -> str:
         
         # Get all tasks with their attempts
         cursor = conn.execute("""
-            SELECT t.*, a.session_id, a.session_url, a.verdict_passed, a.gate_failed,
-                   a.claim_json, a.evidence_json, a.acus_consumed
+            SELECT t.*, a.session_id, a.session_url, a.pr_url, a.verdict_passed, a.gate_failed,
+                   a.claim_json, a.evidence_json
             FROM tasks t
             LEFT JOIN attempts a ON t.current_attempt_id = a.id
             ORDER BY t.updated_at DESC
         """)
         tasks = [dict(row) for row in cursor.fetchall()]
-        
-        # Get today's ACU usage - use attempts.ended_at for accurate attribution
-        cursor = conn.execute("""
-            SELECT SUM(acus_consumed) as total
-            FROM attempts
-            WHERE date(ended_at) = date('now')
-        """)
-        acu_result = cursor.fetchone()
-        acus_today = acu_result["total"] if acu_result and acu_result["total"] else 0.0
-        
+
         # TRUST: agent claims vs verifier confirmations
         cursor = conn.execute("""
             SELECT 
@@ -158,17 +323,7 @@ async def status() -> str:
         verifier_caught = trust_result["caught"] if trust_result and trust_result["caught"] else 0
         trust_rate_str = f"{(verifier_confirmed / agent_claims * 100):.0f}%" if agent_claims else "—"
 
-        # COST: ROI calculation
-        cursor = conn.execute("""
-            SELECT 
-                SUM(a.acus_consumed) as total_acus
-            FROM attempts a
-            WHERE a.ended_at IS NOT NULL
-        """)
-        cost_result = cursor.fetchone()
-        total_acus_all = cost_result["total_acus"] if cost_result and cost_result["total_acus"] else 0.0
-        
-        # Count merged PRs separately
+        # THROUGHPUT: work that made it all the way to merged
         cursor = conn.execute("""
             SELECT COUNT(*) as merged_prs
             FROM tasks
@@ -176,7 +331,7 @@ async def status() -> str:
         """)
         merged_result = cursor.fetchone()
         merged_prs = merged_result["merged_prs"] if merged_result and merged_result["merged_prs"] else 0
-        
+
         # GATES: rejections by gate
         cursor = conn.execute("""
             SELECT gate_failed, COUNT(*) as count
@@ -187,23 +342,19 @@ async def status() -> str:
         gate_results = cursor.fetchall()
         gate_failures = {row["gate_failed"]: row["count"] for row in gate_results}
         
-        # Median cycle time (find→verified)
-        cursor = conn.execute("""
-            SELECT 
-                AVG((julianday(a.ended_at) - julianday(t.created_at)) * 24 * 60) as avg_minutes
-            FROM attempts a
-            JOIN tasks t ON a.fp = t.fp
-            WHERE a.verdict_passed = 1 AND a.ended_at IS NOT NULL
-        """)
-        cycle_time_result = cursor.fetchone()
-        avg_cycle_time = cycle_time_result["avg_minutes"] if cycle_time_result and cycle_time_result["avg_minutes"] else None
-    
+        # Average time from discovery to a PR waiting on a human.
+        avg_cycle_time = _avg_discovery_to_review_minutes(conn)
+
+        # OUTCOMES: autonomy, first-pass yield, hours returned.
+        outcomes = _outcome_metrics(conn)
+
+    autonomy = outcomes["autonomy"]
+    first_pass = outcomes["first_pass"]
+    returned = outcomes["hours_returned"]
+
     # Build counts
-    total_findings = state_counts.get("PENDING", 0) + state_counts.get("RUNNING", 0) + \
-                     state_counts.get("VERIFYING", 0) + state_counts.get("READY", 0) + \
-                     state_counts.get("MERGED", 0) + state_counts.get("QUARANTINED", 0) + \
-                     state_counts.get("FAILED", 0) + state_counts.get("BLOCKED", 0)
-    
+    total_findings = sum(state_counts.values())
+
     pending = state_counts.get("PENDING", 0)
     running = state_counts.get("RUNNING", 0) + state_counts.get("VERIFYING", 0)
     verified = state_counts.get("READY", 0)
@@ -211,53 +362,54 @@ async def status() -> str:
     quarantined = state_counts.get("QUARANTINED", 0)
     needs_human = state_counts.get("BLOCKED", 0)
     failed = state_counts.get("FAILED", 0)
+    closed = state_counts.get("CLOSED", 0)
     needs_attention = needs_human + quarantined + failed
 
     # Sort tasks by what needs a human first, not just recency.
     # BLOCKED/QUARANTINED/FAILED need action now; READY is waiting on a merge;
-    # RUNNING/VERIFYING/PENDING are in flight; MERGED is done.
+    # RUNNING/VERIFYING/PENDING are in flight; MERGED and CLOSED are done.
+    # CLOSED sorts last with MERGED: a human already ruled on it.
     state_priority = {
         "BLOCKED": 0, "QUARANTINED": 1, "FAILED": 2, "READY": 3,
-        "RUNNING": 4, "VERIFYING": 4, "PENDING": 5, "MERGED": 6,
+        "RUNNING": 4, "VERIFYING": 4, "PENDING": 5, "MERGED": 6, "CLOSED": 6,
     }
     tasks.sort(key=lambda t: state_priority.get(t["state"], 99))
 
-    # Check HALT latch and liveness (import reconciler module to access the globals)
+    # Check HALT latch and liveness (read the reconciler module globals directly)
     halt_banner = ""
-    last_tick_str = "never"
     exception_banner = ""
-    try:
-        import reconciler
-        if reconciler._halt_latched:
-            halt_banner = '<div class="banner banner-stop"><strong>HALT LATCHED</strong> — no new sessions allowed</div>'
-        
-        # Get last tick time
-        last_tick_time = reconciler.get_last_tick_time()
-        if last_tick_time:
-            now = datetime.now(timezone.utc)
-            # Ensure both datetimes are timezone-aware
-            if last_tick_time.tzinfo is None:
-                last_tick_time = last_tick_time.replace(tzinfo=timezone.utc)
-            seconds_ago = (now - last_tick_time).total_seconds()
-            if seconds_ago < 60:
-                last_tick_str = f"{int(seconds_ago)}s ago"
-            else:
-                minutes_ago = int(seconds_ago / 60)
-                last_tick_str = f"{minutes_ago}m ago"
-        
-        # Get last tick exception
-        last_exception = reconciler.get_last_tick_exception()
-        if last_exception:
-            exception_banner = f'<div class="banner banner-stop"><strong>Last tick error:</strong> {escape(str(last_exception))}</div>'
+    if reconciler._halt_latched:
+        halt_banner = '<div class="banner banner-stop"><strong>HALT LATCHED</strong> — no new sessions allowed</div>'
 
-        # Get orphaned session count
-        orphaned_count = reconciler.get_orphaned_session_count()
-        if orphaned_count > 0:
-            orphaned_banner = f'<div class="banner banner-warn"><strong>{orphaned_count} orphaned session(s)</strong> detected</div>'
-            exception_banner = exception_banner + orphaned_banner if exception_banner else orphaned_banner
-    except ImportError:
-        pass  # reconciler module not available in demo mode
-    
+    last_tick_str = _ago(reconciler.get_last_tick_time())
+
+    # The scan is the trigger that feeds this whole pipeline, so its liveness
+    # belongs next to the reconciler's: a loop ticking happily against a scanner
+    # that died six hours ago looks identical to a healthy system otherwise.
+    last_scan_str = _ago(scanner.get_last_scan_time())
+    if config.SCAN_INTERVAL_MINUTES <= 0:
+        last_scan_str += " (schedule off)"
+
+    scan_error = scanner.get_last_scan_error()
+    if scan_error:
+        exception_banner += (
+            f'<div class="banner banner-stop"><strong>Last scan failed:</strong> '
+            f"{escape(str(scan_error))}</div>"
+        )
+
+    # Get last tick exception
+    last_exception = reconciler.get_last_tick_exception()
+    if last_exception:
+        exception_banner += f'<div class="banner banner-stop"><strong>Last tick error:</strong> {escape(str(last_exception))}</div>'
+
+    # Get orphaned session count
+    orphaned_count = reconciler.get_orphaned_session_count()
+    if orphaned_count > 0:
+        exception_banner += (
+            f'<div class="banner banner-warn"><strong>{orphaned_count} orphaned '
+            f"session(s)</strong> detected</div>"
+        )
+
     # Render the gate summary — escaped, since gate names come from attempt rows.
     gates_str = " · ".join(
         f"{escape(str(gate))} {count}" for gate, count in gate_failures.items()
@@ -268,8 +420,8 @@ async def status() -> str:
     # Case carries meaning here, so it is applied consistently:
     #   ALL CAPS    — machine enum values (PENDING, RUNNING, HALT LATCHED)
     #   Title Case  — labels we wrote (column headers, buttons)
-    #   lowercase   — prose and values (15s ago, 0.0 / 25.0 ACU)
-    # The demoted small labels (TRUST/COST/GATES, column headers) are a separate
+    #   lowercase   — prose and values (15s ago, avg discovery→review 348m)
+    # The demoted small labels (TRUST/THROUGHPUT/GATES, column headers) are a separate
     # register from body-size caps, so they don't compete with the state values.
     html = f"""
     <html lang="en">
@@ -317,14 +469,17 @@ async def status() -> str:
             .banner-stop {{ background-color: #ffe3e3; border: 1px solid #e05252; }}
             .banner-warn {{ background-color: #fff3cd; border: 1px solid #d99b28; }}
 
-            .stats {{ display: flex; flex-wrap: wrap; gap: 40px; margin-bottom: 6px; }}
+            .stats {{ display: flex; flex-wrap: wrap; gap: 40px; margin-bottom: 26px; }}
             .stat-value {{ font-family: var(--mono); font-size: 26px; font-weight: 700; line-height: 1.15; }}
             .stat-label {{ color: var(--ink-mute); margin-top: 3px; }}
             .stat.is-zero .stat-value {{ color: var(--ink-mute); font-weight: 400; }}
-            .stats-detail {{ font-family: var(--mono); font-size: 12.5px;
-                            color: var(--ink-soft); margin-bottom: 26px; }}
 
-            .metrics {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px;
+            /* Two rows of three: outcomes on top (did it work, what was it
+               worth), mechanism underneath (how do I know). The row gap is
+               wider than the column gap so the two registers read as bands
+               rather than one undifferentiated six-up grid. */
+            .metrics {{ display: grid; grid-template-columns: repeat(3, 1fr);
+                       column-gap: 28px; row-gap: 22px;
                        padding: 18px 20px; margin-bottom: 30px;
                        background-color: #fafafa; border: 1px solid var(--rule); border-radius: 8px; }}
             .metric-label {{ color: var(--ink-mute); margin-bottom: 5px; }}
@@ -381,6 +536,8 @@ async def status() -> str:
             .state-MERGED {{ background-color: #eef2ee; color: #5f7566; }}
             .state-QUARANTINED {{ background-color: #f8d7da; color: #86212b; }}
             .state-FAILED {{ background-color: #f8d7da; color: #86212b; }}
+            /* A human declined it - settled, not an alarm. */
+            .state-CLOSED {{ background-color: #ede9e3; color: #6b5f52; }}
             .state-BLOCKED {{ background-color: #ffe5b4; color: #8a5200; }}
             /* Modifier on the state, not a state of its own — hence the flat treatment. */
             td.state {{ white-space: nowrap; }}
@@ -393,7 +550,7 @@ async def status() -> str:
         <div class="header">
             <div>
                 <h1>COGNITION-PROJECT</h1>
-                <div class="subhead">Today {acus_today:.1f} / {config.DAILY_ACU_CEILING} ACU · last tick {last_tick_str}</div>
+                <div class="subhead">last tick {last_tick_str} · last scan {last_scan_str}</div>
             </div>
             <form action="/scan" method="post">
                 <button type="submit">Scan Now</button>
@@ -409,20 +566,32 @@ async def status() -> str:
             {_stat(verified, 'Ready to merge', not verified)}
             {_stat(merged, 'Merged', not merged)}
         </div>
-        <div class="stats-detail">
-            {_count(needs_human, 'blocked')} · {_count(quarantined, 'quarantined')} · {_count(failed, 'failed')}
-        </div>
 
         <div class="metrics">
+            <div>
+                <div class="metric-label">Autonomy</div>
+                <div class="metric-value">{_pct(autonomy['rate'])}</div>
+                <div class="metric-detail">{autonomy['autonomous']} of {autonomy['resolved']} resolved · {_count(autonomy['interrupted'], 'needed a human')}</div>
+            </div>
+            <div>
+                <div class="metric-label">First-pass yield</div>
+                <div class="metric-value">{_pct(first_pass['rate'])}</div>
+                <div class="metric-detail">{first_pass['first_pass']} of {first_pass['judged']} passed on attempt 1</div>
+            </div>
+            <div>
+                <div class="metric-label">Hours returned</div>
+                <div class="metric-value">{_hours(returned['hours'])}</div>
+                <div class="metric-detail">{returned['remediated']} remediated × {returned['assumed_minutes_per_fix']}m assumed</div>
+            </div>
             <div>
                 <div class="metric-label">Trust</div>
                 <div class="metric-value">{trust_rate_str}</div>
                 <div class="metric-detail">{agent_claims} claims · {verifier_confirmed} confirmed · {verifier_caught} caught</div>
             </div>
             <div>
-                <div class="metric-label">Cost</div>
-                <div class="metric-value">{total_acus_all:.1f} ACU</div>
-                <div class="metric-detail">{merged_prs} merged PRs{f' · avg find→verified {avg_cycle_time:.0f}m' if avg_cycle_time else ''}</div>
+                <div class="metric-label">Throughput</div>
+                <div class="metric-value">{merged_prs} merged</div>
+                <div class="metric-detail">{f'{avg_cycle_time:.0f}m avg discovery→review' if avg_cycle_time else 'no completed cycles yet'}</div>
             </div>
             <div>
                 <div class="metric-label">Gates</div>
@@ -437,7 +606,6 @@ async def status() -> str:
                     <th>Fingerprint</th>
                     <th>State</th>
                     <th class="num">Attempts</th>
-                    <th class="num">ACU</th>
                     <th class="num">Age</th>
                     <th>Verdict &amp; Claim</th>
                     <th>Links</th>
@@ -451,8 +619,7 @@ async def status() -> str:
         fp = task["fp"]
         state = task["state"]
         attempt_count = task["attempt_count"]
-        acus = task["acus_total"]
-        
+
         # Calculate age
         created_at = task.get("created_at")
         age_str = "—"
@@ -487,12 +654,15 @@ async def status() -> str:
         # Build links
         issue_number = task.get("issue_number")
         session_url = task.get("session_url")
+        pr_url = task.get("pr_url")
         
         links = []
         if issue_number:
-            links.append(f'<a class="chip" href="https://github.com/{config.GITHUB_REPO}/issues/{escape(str(issue_number))}">Issue</a>')
+            links.append(f'<a class="chip" href="https://github.com/{config.GITHUB_REPO}/issues/{escape(str(issue_number))}" target="_blank">Issue</a>')
         if session_url:
-            links.append(f'<a class="chip" href="{escape(str(session_url))}">Session</a>')
+            links.append(f'<a class="chip" href="{escape(str(session_url))}" target="_blank">Session</a>')
+        if pr_url:
+            links.append(f'<a class="chip" href="{escape(str(pr_url))}" target="_blank">PR</a>')
         
         # Chips on a single nowrap row. Underlined text links read as prose, go ragged
         # when they wrap, and leave a dangling separator behind them.
@@ -503,7 +673,6 @@ async def status() -> str:
                     <td>{escape(str(fp))}</td>
                     <td class="state">{state_cell}</td>
                     <td class="num">{_muted(attempt_count, not attempt_count)}</td>
-                    <td class="num">{_muted(f'{acus:.1f}', not acus)}</td>
                     <td class="num">{_muted(age_str, age_str == "—")}</td>
                     <td class="claim-verdict">{claim_verdict}</td>
                     <td class="links">{links_str}</td>
@@ -520,17 +689,16 @@ async def status() -> str:
     return html
 
 
-def _gate_lists(evidence_json) -> tuple:
-    """Pull (passed, skipped) gate names out of an attempt's stored evidence."""
-    if not evidence_json:
-        return [], []
-    try:
-        evidence = json.loads(evidence_json) if isinstance(evidence_json, str) else evidence_json
-    except (json.JSONDecodeError, TypeError):
-        return [], []
-    if not isinstance(evidence, dict):
-        return [], []
-    return evidence.get("gates_passed") or [], evidence.get("gates_skipped") or []
+def _split_reason(reason: str) -> tuple:
+    """Split a terminal reason into (badge cause, body detail).
+
+    Reasons are written "<cause>: <detail>". The cause is short enough to sit in
+    a verdict badge next to "REJECT (oracle)"; the detail belongs in the body
+    text. A reason with no colon is already short, so it becomes the badge and
+    the body stays empty.
+    """
+    cause, _, detail = str(reason).partition(": ")
+    return cause.strip(), detail.strip()
 
 
 def build_claim_verdict(task: dict) -> str:
@@ -546,16 +714,23 @@ def build_claim_verdict(task: dict) -> str:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute("""
-            SELECT attempt_no, claim_json, verdict_passed, gate_failed, evidence_json
+            SELECT attempt_no, claim_json, verdict_passed, gate_failed
             FROM attempts
             WHERE fp = ?
             ORDER BY attempt_no
         """, (fp,))
         attempts = [dict(row) for row in cursor.fetchall()]
-    
-    if not attempts:
-        return _muted("—")
 
+    # A task can reach a terminal state without any gate ever returning a
+    # verdict - the wall clock expiring, the session dying, a human closing the
+    # PR. Those used to render as an em-dash, which is why a FAILED task on this
+    # page gave no hint why it failed.
+    reason = task.get("failure_reason")
+
+    if not attempts:
+        return escape(str(reason)) if reason else _muted("—")
+
+    reason_shown = False
     parts = []
     for attempt in attempts:
         # Parse claim
@@ -569,42 +744,62 @@ def build_claim_verdict(task: dict) -> str:
                 
                 # Extract the claim summary
                 if isinstance(claim, dict):
-                    claim_text = claim.get("summary", claim.get("fix_description", "fixed"))
+                    claim_text = claim.get("summary") or claim.get("fix_description")
                 else:
                     claim_text = str(claim)
             except (json.JSONDecodeError, TypeError):
-                claim_text = "fixed"
+                claim_text = None
         else:
-            claim_text = "fixed"
+            claim_text = None
+
+        # An attempt that has filed no claim gets no claim text. This used to
+        # fall back to the literal "fixed", which put a fix the agent had never
+        # reported - and on a RUNNING task, had not yet even finished attempting -
+        # into the one column that exists to hold the agent to its own words.
+        # Distinguished here so a real claim is never overwritten below.
+        has_claim = bool(claim_text)
         
         # Add verdict
         verdict_passed = attempt.get("verdict_passed")
         gate_failed = attempt.get("gate_failed")
         
         if verdict_passed == 1:
-            # "PASS" on its own invites the reader to assume every gate ran.
-            # Name the gates, and name any that were skipped.
-            passed_gates, skipped_gates = _gate_lists(attempt.get("evidence_json"))
-            detail = ", ".join(passed_gates)
-            if skipped_gates:
-                detail += f"; {', '.join(skipped_gates)} skipped"
-            verdict = f"PASS ({detail})" if detail else "PASS"
-            verdict_class = "verdict-pass"
+            verdict, verdict_class = "PASS", "verdict-pass"
         elif verdict_passed == 0:
             verdict = f"REJECT ({gate_failed})" if gate_failed else "REJECT"
             verdict_class = "verdict-reject"
+        elif reason and task.get("state") in ("FAILED", "CLOSED"):
+            # No gate ever returned a verdict, but the task ended anyway - the
+            # wall clock expired, the session died, a human closed the PR.
+            # "PENDING" would read as still in flight; say what happened.
+            #
+            # Reasons are written "<cause>: <detail>" so the badge stays as
+            # short as "REJECT (oracle)" and the detail drops into the body
+            # text below it. Putting the whole sentence in the badge stretched
+            # it into a pink slab across the row.
+            cause, detail_text = _split_reason(reason)
+            verdict, verdict_class = cause, "verdict-reject"
+            # Only fill the body with the detail when there is no real claim to
+            # displace; an agent's own words outrank our explanation of them.
+            if detail_text and not has_claim:
+                claim_text = detail_text
+            reason_shown = True
         else:  # verdict_passed is None
             verdict, verdict_class = "PENDING", "verdict-pending"
 
         # The verdict leads and is never clipped — it is what a human scans this
         # column for. The claim is the agent's own self-report, so it is escaped.
-        safe_claim = escape(str(claim_text))
+        safe_claim = escape(str(claim_text)) if claim_text else ""
 
         # Long claims clamp to 3 lines behind a Show more toggle. The toggle is a
         # hidden checkbox rather than JavaScript, so the page stays script-free.
         # Short claims fit already, so they skip the control entirely — roughly
         # three lines at this column width and type size.
-        if len(str(claim_text)) > CLAIM_CLAMP_CHARS:
+        if not claim_text:
+            # Nothing claimed yet: the verdict badge stands alone rather than
+            # captioning itself with words the agent never said.
+            body = ""
+        elif len(str(claim_text)) > CLAIM_CLAMP_CHARS:
             toggle_id = f"claim-{escape(str(fp))}-{attempt.get('attempt_no', 0)}"
             body = (
                 f'<input type="checkbox" class="claim-toggle" id="{toggle_id}">'
@@ -621,23 +816,36 @@ def build_claim_verdict(task: dict) -> str:
             f"</div>"
         )
 
+    # A terminal reason the verdict chain does not already carry - a human
+    # closing a PR that passed every gate, say - is the most important thing in
+    # this column and would otherwise be invisible behind a green PASS.
+    if reason and not reason_shown and task.get("state") in ("FAILED", "CLOSED"):
+        cause, detail_text = _split_reason(reason)
+        body = (
+            f'<div class="claim-text">{escape(detail_text)}</div>' if detail_text else ""
+        )
+        parts.append(
+            f'<div class="attempt">'
+            f'<span class="verdict verdict-reject">{escape(cause)}</span>'
+            f"{body}"
+            f"</div>"
+        )
+
     return "".join(parts)
 
 
 @app.post("/scan")
 async def trigger_scan() -> Response:
-    """Trigger a scan for demo purposes.
-    
-    This allows the demo to work without waiting for a webhook to arrive on cue.
+    """Trigger a scan on demand.
+
+    The same scan the schedule runs, on the same code path - this only exists so
+    a demo does not have to wait out SCAN_INTERVAL_MINUTES. Run in a thread:
+    Bandit over superset/ takes long enough to stall the reconciler and every
+    other request if it ran on the event loop.
     """
     try:
-        # Scan the repo under review, not the directory this process runs in.
-        findings = scanner.scan(config.TARGET_REPO_PATH)
-
-        # Sync findings to database
-        scanner.sync_findings(findings)
-        
-        return Response(content=f"Scan complete. {len(findings)} findings synced.", status_code=200)
+        count = await asyncio.to_thread(scanner.run_scan)
+        return Response(content=f"Scan complete. {count} findings synced.", status_code=200)
     except Exception as e:
         return Response(content=f"Scan failed: {str(e)}", status_code=500)
 
@@ -679,17 +887,7 @@ async def metrics_json() -> JSONResponse:
         verifier_confirmed = trust_result["confirmed"] if trust_result else 0
         verifier_caught = trust_result["caught"] if trust_result else 0
         
-        # COST: ROI calculation
-        cursor = conn.execute("""
-            SELECT 
-                SUM(a.acus_consumed) as total_acus
-            FROM attempts a
-            WHERE a.ended_at IS NOT NULL
-        """)
-        cost_result = cursor.fetchone()
-        total_acus_all = cost_result["total_acus"] if cost_result and cost_result["total_acus"] else 0.0
-        
-        # Count merged PRs separately
+        # THROUGHPUT: work that made it all the way to merged
         cursor = conn.execute("""
             SELECT COUNT(*) as merged_prs
             FROM tasks
@@ -697,7 +895,7 @@ async def metrics_json() -> JSONResponse:
         """)
         merged_result = cursor.fetchone()
         merged_prs = merged_result["merged_prs"] if merged_result and merged_result["merged_prs"] else 0
-        
+
         # GATES: rejections by gate
         cursor = conn.execute("""
             SELECT gate_failed, COUNT(*) as count
@@ -708,26 +906,12 @@ async def metrics_json() -> JSONResponse:
         gate_results = cursor.fetchall()
         gate_failures = {row["gate_failed"]: row["count"] for row in gate_results}
         
-        # Avg cycle time
-        cursor = conn.execute("""
-            SELECT 
-                AVG((julianday(a.ended_at) - julianday(t.created_at)) * 24 * 60) as avg_minutes
-            FROM attempts a
-            JOIN tasks t ON a.fp = t.fp
-            WHERE a.verdict_passed = 1 AND a.ended_at IS NOT NULL
-        """)
-        cycle_time_result = cursor.fetchone()
-        avg_cycle_time = cycle_time_result["avg_minutes"] if cycle_time_result and cycle_time_result["avg_minutes"] else None
-        
-        # Today's ACU usage
-        cursor = conn.execute("""
-            SELECT SUM(acus_consumed) as total
-            FROM attempts
-            WHERE date(ended_at) = date('now')
-        """)
-        acu_result = cursor.fetchone()
-        acus_today = acu_result["total"] if acu_result and acu_result["total"] else 0.0
-        
+        # Average time from discovery to a PR waiting on a human.
+        avg_cycle_time = _avg_discovery_to_review_minutes(conn)
+
+        # OUTCOMES: autonomy, first-pass yield, hours returned.
+        outcomes = _outcome_metrics(conn)
+
         # Build state counts
         pending = state_counts.get("PENDING", 0)
         running = state_counts.get("RUNNING", 0) + state_counts.get("VERIFYING", 0)
@@ -736,33 +920,16 @@ async def metrics_json() -> JSONResponse:
         quarantined = state_counts.get("QUARANTINED", 0)
         needs_human = state_counts.get("BLOCKED", 0)
         failed = state_counts.get("FAILED", 0)
-        total_findings = pending + running + verified + merged + quarantined + needs_human + failed
+        closed = state_counts.get("CLOSED", 0)
+        # Sum the map rather than named states: a state added later is counted
+        # automatically instead of silently vanishing from the total.
+        total_findings = sum(state_counts.values())
         
         # Liveness info
-        last_tick_time = None
-        last_tick_exception = None
-        orphaned_count = 0
-        try:
-            import reconciler
-            last_tick_time = reconciler.get_last_tick_time()
-            last_tick_exception = reconciler.get_last_tick_exception()
-            orphaned_count = reconciler.get_orphaned_session_count()
-        except ImportError:
-            pass
-        
-        # Format last tick time
-        last_tick_str = None
-        if last_tick_time:
-            now = datetime.now(timezone.utc)
-            # Ensure both datetimes are timezone-aware
-            if last_tick_time.tzinfo is None:
-                last_tick_time = last_tick_time.replace(tzinfo=timezone.utc)
-            seconds_ago = (now - last_tick_time).total_seconds()
-            if seconds_ago < 60:
-                last_tick_str = f"{int(seconds_ago)}s ago"
-            else:
-                minutes_ago = int(seconds_ago / 60)
-                last_tick_str = f"{minutes_ago}m ago"
+        last_tick_time = reconciler.get_last_tick_time()
+        last_tick_exception = reconciler.get_last_tick_exception()
+        orphaned_count = reconciler.get_orphaned_session_count()
+        last_tick_str = _ago(last_tick_time, never=None)
 
         return JSONResponse(content={
             "trust": {
@@ -778,30 +945,48 @@ async def metrics_json() -> JSONResponse:
                 "merged": merged,
                 "quarantined": quarantined,
                 "needs_human": needs_human,
-                "failed": failed
+                "failed": failed,
+                "closed": closed
             },
-            "cost": {
-                "total_acus": total_acus_all,
+            "throughput": {
                 "merged_prs": merged_prs,
-                "avg_cycle_time_minutes": avg_cycle_time
+                "avg_discovery_to_review_minutes": avg_cycle_time
             },
+            "autonomy": outcomes["autonomy"],
+            "first_pass_yield": outcomes["first_pass"],
+            "hours_returned": outcomes["hours_returned"],
             "gates": gate_failures,
             "liveness": {
                 "last_tick": last_tick_str,
                 "last_tick_exception": last_tick_exception,
-                "orphaned_sessions": orphaned_count
-            },
-            "budget": {
-                "acus_today": acus_today,
-                "daily_acu_ceiling": config.DAILY_ACU_CEILING
+                "orphaned_sessions": orphaned_count,
+                # The trigger's own health. A consumer polling this endpoint has
+                # to be able to tell "nothing to do" from "nothing is looking".
+                "last_scan": _ago(scanner.get_last_scan_time(), never=None),
+                "last_scan_findings": scanner.get_last_scan_findings(),
+                "last_scan_error": scanner.get_last_scan_error(),
+                "scan_interval_minutes": config.SCAN_INTERVAL_MINUTES
             }
         })
 
 
-def should_tick_immediately() -> bool:
-    """Check if a webhook was received and reset the flag."""
-    global _webhook_received
-    if _webhook_received:
-        _webhook_received = False
-        return True
-    return False
+def webhook_signal() -> asyncio.Event:
+    """The Event a webhook delivery sets. Must be called from inside the loop.
+
+    The reconciler loop owns clearing it, and clears it *before* each tick so a
+    delivery that lands mid-tick is not swallowed - it leaves the Event set and
+    the loop re-ticks immediately rather than waiting out the interval.
+
+    Rebuilt if the running loop is not the one it was built on. In the service
+    there is only ever one loop; this keeps the module safe to drive from a test
+    that runs several, which on Python 3.9 would otherwise wait on an Event
+    bound to a loop that is already closed.
+    """
+    global _webhook_event, _webhook_loop
+
+    loop = asyncio.get_running_loop()
+    if _webhook_event is None or _webhook_loop is not loop:
+        _webhook_event = asyncio.Event()
+        _webhook_loop = loop
+
+    return _webhook_event

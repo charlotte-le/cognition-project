@@ -7,10 +7,11 @@ import json
 import subprocess
 
 import pytest
+from dataclasses import replace
 from pathlib import Path
 
 from cognition.core import config
-from cognition.verification import verifier
+from cognition.verification import scanner, verifier
 from cognition.verification.verifier import VerifyContext, verify
 
 # Use project root directory for tests that need a valid path
@@ -454,7 +455,7 @@ class TestInfraFailuresDoNotCountAsAttempts:
 
     def _run(
         self, monkeypatch, bandit_stdout, test_returncode, test_stderr="",
-        run_tests_gate=True,
+        run_tests_gate=True, ctx=None,
     ):
         # The checkout is exercised in TestPRCheckout; here we only care that
         # gates 3 and 4 classify their own failures correctly.
@@ -473,7 +474,7 @@ class TestInfraFailuresDoNotCountAsAttempts:
             return subprocess.CompletedProcess(cmd, test_returncode, "", test_stderr)
 
         monkeypatch.setattr(verifier.subprocess, "run", fake_run)
-        return verify(self._ctx())
+        return verify(ctx if ctx is not None else self._ctx())
 
     # Bandit reporting a missing target, as it did in production.
     MISSING_TARGET = json.dumps({
@@ -555,13 +556,22 @@ class TestInfraFailuresDoNotCountAsAttempts:
         assert verdict.evidence["bandit_total_findings_unfiltered"] == 3
 
     def test_new_finding_in_a_tracked_rule_still_rejects(self, monkeypatch):
-        """Filtering must not blind the gate to genuine regressions."""
+        """Filtering must not blind the gate to genuine regressions.
+
+        The regression is in superset/file.py, the file this PR edits - that is
+        the only place a diff can actually introduce one.
+        """
         regression = json.dumps({
             "errors": [],
             "metrics": {"_totals": {"loc": 5000}},
             "results": [
                 {"test_id": "B101", "filename": "superset/a.py", "code": "assert x"},
-                {"test_id": "B608", "filename": "superset/new.py", "code": "f'SELECT {x}'"},
+                {
+                    "test_id": "B608",
+                    "filename": "superset/file.py",
+                    "line_number": 12,
+                    "code": "12         f'SELECT {x}'",
+                },
             ],
         })
         verdict = self._run(monkeypatch, regression, 0)
@@ -569,6 +579,92 @@ class TestInfraFailuresDoNotCountAsAttempts:
         assert verdict.passed is False
         assert verdict.gate == "oracle"
         assert "new finding" in verdict.reason
+        assert "superset/file.py:12" in verdict.reason
+
+    def test_unfiled_finding_in_an_untouched_file_is_not_this_prs_fault(self, monkeypatch):
+        """The ledger lags master; the gap must not be charged to the PR.
+
+        The scanner files findings on its own schedule, so between scans Bandit
+        sees findings on master that the ledger has no row for. Attributing
+        those to the PR rejected three correct fixes in a row (attempts 34, 35
+        and 36) over six findings in files those PRs never opened.
+        """
+        unfiled = json.dumps({
+            "errors": [],
+            "metrics": {"_totals": {"loc": 5000}},
+            "results": [
+                {
+                    "test_id": "B608",
+                    "filename": "superset/db_engine_specs/mssql.py",
+                    "line_number": 196,
+                    "code": "196         q = f'SELECT {t}'",
+                },
+            ],
+        })
+        verdict = self._run(monkeypatch, unfiled, 0)
+
+        assert verdict.passed is True
+        assert "oracle" in verdict.evidence["gates_passed"]
+
+    def test_a_preexisting_finding_that_only_moved_is_not_new(self, monkeypatch):
+        """A fix that changes a file's length must not indict its neighbours.
+
+        Bandit's `code` field carries line numbers, so hashing it made every
+        finding below an edit look new. That is what forced passing attempts to
+        contort the fix until it was line-count neutral.
+        """
+        neighbour = "        q = f'SELECT {t}'"
+        ctx = replace(
+            self._ctx(),
+            known_finding_keys=[
+                scanner.finding_key("B608", "superset/file.py", f"40 {neighbour}")
+            ],
+        )
+        moved = json.dumps({
+            "errors": [],
+            "metrics": {"_totals": {"loc": 5000}},
+            "results": [
+                {
+                    "test_id": "B608",
+                    "filename": "superset/file.py",
+                    "line_number": 42,
+                    "code": f"42 {neighbour}",
+                },
+            ],
+        })
+        verdict = self._run(monkeypatch, moved, 0, ctx=ctx)
+
+        assert verdict.passed is True
+        assert "oracle" in verdict.evidence["gates_passed"]
+
+    def test_target_finding_that_only_moved_is_still_unfixed(self, monkeypatch):
+        """The converse: moving the finding is not fixing it.
+
+        Line-sensitive fingerprints would report the target as gone the moment
+        it shifted, passing a PR that resolved nothing.
+        """
+        target = "        q = f'SELECT {t}'"
+        ctx = replace(
+            self._ctx(),
+            target_key=scanner.finding_key("B608", "superset/file.py", f"40 {target}"),
+        )
+        moved = json.dumps({
+            "errors": [],
+            "metrics": {"_totals": {"loc": 5000}},
+            "results": [
+                {
+                    "test_id": "B608",
+                    "filename": "superset/file.py",
+                    "line_number": 42,
+                    "code": f"42 {target}",
+                },
+            ],
+        })
+        verdict = self._run(monkeypatch, moved, 0, ctx=ctx)
+
+        assert verdict.passed is False
+        assert verdict.gate == "oracle"
+        assert "not resolved" in verdict.reason
 
     def test_clean_run_passes_all_gates(self, monkeypatch):
         """A readable scan with no findings and green tests passes."""

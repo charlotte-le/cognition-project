@@ -17,6 +17,14 @@ class State(str, Enum):
     MERGED = "MERGED"
     QUARANTINED = "QUARANTINED"
     FAILED = "FAILED"
+    # A human reviewed the PR and closed it without merging. Distinct from
+    # QUARANTINED (the harness rejected the work) and from FAILED (the
+    # machinery broke): here the pipeline worked and a person said no.
+    CLOSED = "CLOSED"
+
+
+# States a task cannot leave. Nothing reconciles these; they are the record.
+TERMINAL_STATES = {State.MERGED, State.QUARANTINED, State.FAILED, State.CLOSED}
 
 
 def _get_db_path() -> str:
@@ -45,11 +53,23 @@ def init_db() -> None:
                 issue_number  INTEGER,
                 state         TEXT NOT NULL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
-                acus_total    REAL NOT NULL DEFAULT 0,
                 payload_json  TEXT,
                 current_attempt_id INTEGER,
                 created_at    TEXT NOT NULL,
-                updated_at    TEXT NOT NULL
+                updated_at    TEXT NOT NULL,
+                -- Why a task reached a terminal state. Without this the reason
+                -- for a FAILED or CLOSED task lives only in the logs, and the
+                -- status page can only say that something went wrong.
+                failure_reason TEXT,
+                -- Set once, when the system had to pull a person in mid-flight:
+                -- the agent asked a question, or the harness gave up and asked
+                -- for a human. A sticky flag rather than a state, because the
+                -- task moves on afterwards and the fact that a human was needed
+                -- has to survive that move for the autonomy rate to mean
+                -- anything. Deliberately NOT set when a reviewer closes a PR:
+                -- that is the review gate working as designed, not the machine
+                -- failing to get there on its own.
+                human_touched INTEGER NOT NULL DEFAULT 0
             )
         """)
         conn.execute("""
@@ -60,17 +80,35 @@ def init_db() -> None:
                 request_id     TEXT NOT NULL,
                 session_id     TEXT,
                 session_url    TEXT,
+                -- The PR this attempt produced, so the status page can link it.
+                pr_url         TEXT,
                 outcome        TEXT,
                 verdict_passed INTEGER,
                 gate_failed    TEXT,
                 claim_json     TEXT,
                 evidence_json  TEXT,
-                acus_consumed  REAL,
                 started_at     TEXT NOT NULL,
                 ended_at       TEXT,
                 UNIQUE(fp, attempt_no)
             )
         """)
+
+        # CREATE TABLE IF NOT EXISTS leaves databases made before a column was
+        # added untouched, so add it here rather than making operators rebuild.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "failure_reason" not in existing:
+            conn.execute("ALTER TABLE tasks ADD COLUMN failure_reason TEXT")
+        if "human_touched" not in existing:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN human_touched INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # Same for attempts.pr_url, which is in the CREATE above but absent from
+        # any database created before it was added.
+        existing_attempts = {row[1] for row in conn.execute("PRAGMA table_info(attempts)")}
+        if "pr_url" not in existing_attempts:
+            conn.execute("ALTER TABLE attempts ADD COLUMN pr_url TEXT")
+
         conn.commit()
 
 
@@ -82,8 +120,8 @@ def upsert_task(fp: str, cls: str, payload: Dict[str, Any]) -> bool:
     
     with sqlite3.connect(db_path) as conn:
         cursor = conn.execute("""
-            INSERT INTO tasks (fp, class, state, attempt_count, acus_total, payload_json, created_at, updated_at)
-            VALUES (?, ?, 'PENDING', 0, 0, ?, ?, ?)
+            INSERT INTO tasks (fp, class, state, attempt_count, payload_json, created_at, updated_at)
+            VALUES (?, ?, 'PENDING', 0, ?, ?, ?)
             ON CONFLICT(fp) DO NOTHING
         """, (fp, cls, payload_json, now, now))
         conn.commit()
@@ -125,6 +163,25 @@ def increment_attempt_count(fp: str) -> bool:
         cursor = conn.execute(
             "UPDATE tasks SET attempt_count = attempt_count + 1, updated_at = ? WHERE fp = ?",
             [now, fp]
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
+def mark_human_touched(fp: str) -> bool:
+    """Record that this task needed a person mid-flight. Idempotent.
+
+    Not a transition: the task keeps moving after a human unblocks it, and the
+    autonomy rate has to remember that it ever stopped. Writing it as a latch
+    means calling this twice on the same task cannot double-count.
+    """
+    db_path = _get_db_path()
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE tasks SET human_touched = 1, updated_at = ? "
+            "WHERE fp = ? AND human_touched = 0",
+            [_now(), fp],
         )
         conn.commit()
         return cursor.rowcount == 1
@@ -221,17 +278,3 @@ def finish_attempt(attempt_id: int, **fields: Any) -> None:
             values
         )
         conn.commit()
-
-
-def acus_today() -> float:
-    """Sum of acus_consumed for attempts that ended today (accurate budget attribution)."""
-    db_path = _get_db_path()
-    today = datetime.utcnow().date().isoformat()
-    
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.execute(
-            "SELECT SUM(acus_consumed) FROM attempts WHERE date(ended_at) = ?",
-            (today,)
-        )
-        result = cursor.fetchone()[0]
-        return result if result is not None else 0.0

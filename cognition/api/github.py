@@ -140,7 +140,11 @@ class GitHubClient:
                     "head_sha": pr.get("head", {}).get("sha"),
                     "body": pr.get("body"),
                     "state": pr.get("state"),
-                    "merged": pr.get("merged", False),
+                    # The list endpoint has no "merged" key - only the single-PR
+                    # endpoint does - so pr.get("merged", False) here was always
+                    # False and no PR could ever be detected as merged. merged_at
+                    # is present on both and is the reliable signal.
+                    "merged": bool(pr.get("merged") or pr.get("merged_at")),
                 }
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:

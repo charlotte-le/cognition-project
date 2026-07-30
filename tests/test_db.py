@@ -129,13 +129,13 @@ def test_transition_with_additional_fields():
         db.State.PENDING, 
         db.State.RUNNING, 
         attempt_count=1,
-        acus_total=5.5
+        failure_reason="boom"
     )
     assert result is True
-    
+
     task = db.get_task(fp)
     assert task["attempt_count"] == 1
-    assert task["acus_total"] == 5.5
+    assert task["failure_reason"] == "boom"
 
 
 def test_start_and_finish_attempt():
